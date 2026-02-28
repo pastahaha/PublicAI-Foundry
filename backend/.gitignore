@@ -1,0 +1,64 @@
+### Python ###
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables
+.env
+
+# Logs and databases
+*.log
+db.sqlite3
+db.sqlite3-journal
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+MANIFEST
+
+# Unit test / coverage reports
+.tox/
+.nox/
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# IDE / Editor settings
+.idea/
+.vscode/
+.ropeproject/
+.spyderproject/
+.spyproject/
+
+# PDM / Poetry / Pipenv
+pdm.lock
+poetry.lock
+Pipfile.lock
