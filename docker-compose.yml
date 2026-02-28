@@ -1,0 +1,58 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: publicai
+      POSTGRES_PASSWORD: publicai_dev
+      POSTGRES_DB: publicai_foundry
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U publicai -d publicai_foundry"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    ports:
+      - "8082:8082"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://publicai:publicai_dev@postgres:5432/publicai_foundry
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-IDz4B6iD7PyP2XeTKSQKI7GpIXanqQ21}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-sk_1edd02035fa320ed90e2e32424b15fb69f2d75d813504358}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://publicai:publicai_dev@postgres:5432/publicai_users
+      INTERNAL_BACKEND_URL: http://backend:8082
+      NEXT_PUBLIC_BACKEND_URL: http://localhost:8082
+      JWT_SECRET: ${JWT_SECRET:-Ab3dEfgHijK9LmNoPqR2StUvWxYz0aB1cDeFgHiJkLm=}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-IDz4B6iD7PyP2XeTKSQKI7GpIXanqQ21}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-sk_1edd02035fa320ed90e2e32424b15fb69f2d75d813504358}
+      NEXT_PUBLIC_TWILIO_WHATSAPP_NUMBER: ${TWILIO_WHATSAPP_NUMBER:-+14155238886}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-753863397471-fbjpf5p373ghqhcs85gdc4t1o4k48qqp.apps.googleusercontent.com}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-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}
+      NEXT_PUBLIC_HAS_GOOGLE: ${NEXT_PUBLIC_HAS_GOOGLE:-false}
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
