@@ -343,12 +343,12 @@ async def chat_with_agent(
 
     history = _agent_threads[thread_id]
 
-    # ── Generate greeting for new threads ────────────────────────────
+    # NOTE: Greeting generation removed.  The brain node's system prompt
+    # already contains the agent's identity & purpose, so the first reply
+    # will naturally reference who the agent is.  Generating a separate
+    # greeting on top of the graph response caused the "double-reply" bug
+    # where the user saw an introductory greeting AND the actual answer.
     greeting = ""
-    greeting_task = None
-    if is_new_thread:
-        # Fire off greeting generation concurrently — don't block graph execution
-        greeting_task = asyncio.create_task(_generate_greeting(assistant))
 
     history.append(HumanMessage(content=req.message))
 
@@ -482,14 +482,6 @@ async def chat_with_agent(
                 conv_messages.append(AgentChatMessage(role="human", content=m.content))
             elif isinstance(m, AIMessage):
                 conv_messages.append(AgentChatMessage(role="ai", content=m.content))
-
-        # Await greeting if it was started concurrently
-        if greeting_task is not None:
-            try:
-                greeting = await greeting_task
-            except Exception as e:
-                logger.error("❌ Greeting generation failed: %s", e)
-                greeting = ""
 
         logger.info(
             "✅ Agent chat complete: thread=%s response=%d chars iterations=%d tools=%d",

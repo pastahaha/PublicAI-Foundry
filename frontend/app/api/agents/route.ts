@@ -14,6 +14,7 @@ function toAgent(a: Record<string, unknown>) {
     model: (config.model_name as string) || "mistral-large-latest",
     systemPrompt: (config.system_prompt as string) || "",
     tools: (config.tools as string[]) || [],
+    voiceId: (config.voice_id as string) || null,
     guardrails: (meta.guardrails as Record<string, unknown>) || {},
     knowledgeBase: (meta.knowledgeBase as Record<string, unknown>) || {},
     isActive: true,

@@ -8,6 +8,9 @@ export default async function WhatsAppPage() {
   const session = await getSession();
   if (!session) redirect("/login");
 
+  // Read at runtime on the server — avoids NEXT_PUBLIC build-time inlining issue
+  const whatsappNumber = process.env.NEXT_PUBLIC_TWILIO_WHATSAPP_NUMBER || "+14155238886";
+
   const whatsAppSessions = await db.whatsAppSession.findMany({
     where: { userId: session.userId },
     include: { user: { select: { name: true } } },
@@ -37,5 +40,5 @@ export default async function WhatsAppPage() {
     return { ...s, agentName: agent?.name || null };
   });
 
-  return <WhatsAppClient sessions={sessionsWithAgent} agents={agents} />;
+  return <WhatsAppClient sessions={sessionsWithAgent} agents={agents} whatsappNumber={whatsappNumber} />;
 }

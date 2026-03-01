@@ -14,12 +14,27 @@ export async function POST(req: NextRequest) {
 
   try {
     const formData = await req.formData();
-    const audio = formData.get("audio") as Blob;
-    if (!audio) return NextResponse.json({ error: "No audio provided" }, { status: 400 });
+    const audio = formData.get("audio") as Blob | null;
+    if (!audio || audio.size === 0) {
+      return NextResponse.json({ error: "No audio provided" }, { status: 400 });
+    }
+
+    // Convert the incoming Blob to a proper buffer for the upstream call
+    const audioBuffer = Buffer.from(await audio.arrayBuffer());
+
+    // Determine the file extension from the mime type
+    const mimeType = audio.type || "audio/webm";
+    const ext = mimeType.includes("mp4") ? "mp4" : "webm";
 
     const elevenFormData = new FormData();
-    elevenFormData.append("file", audio, "audio.webm");
+    elevenFormData.append(
+      "file",
+      new Blob([audioBuffer], { type: mimeType }),
+      `audio.${ext}`
+    );
     elevenFormData.append("model_id", "scribe_v1");
+    // Language hint for better accuracy
+    elevenFormData.append("language_code", "en");
 
     const res = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
       method: "POST",
@@ -29,14 +44,21 @@ export async function POST(req: NextRequest) {
 
     if (!res.ok) {
       const err = await res.text();
-      console.error("ElevenLabs STT error:", err);
-      return NextResponse.json({ error: "Speech recognition failed" }, { status: 502 });
+      console.error("ElevenLabs STT error:", res.status, err);
+      // Provide more specific error messages
+      if (res.status === 401) {
+        return NextResponse.json({ error: "Invalid ElevenLabs API key. Check your key in Settings." }, { status: 401 });
+      }
+      if (res.status === 429) {
+        return NextResponse.json({ error: "Rate limit reached. Try again in a moment." }, { status: 429 });
+      }
+      return NextResponse.json({ error: "Speech recognition failed — try speaking more clearly" }, { status: 502 });
     }
 
     const data = await res.json();
     return NextResponse.json({ text: data.text || "" });
   } catch (err) {
-    console.error(err);
+    console.error("STT route error:", err);
     return NextResponse.json({ error: "Internal server error" }, { status: 500 });
   }
 }

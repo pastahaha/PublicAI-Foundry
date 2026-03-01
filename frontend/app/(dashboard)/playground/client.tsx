@@ -36,6 +36,7 @@ interface Agent {
   name: string;
   description: string | null;
   model: string;
+  voiceId?: string | null;
 }
 
 interface Message {
@@ -167,7 +168,7 @@ const MD_COMPONENTS: Components = {
 
 // ─── SpeakerButton ───────────────────────────────────────────────────────────
 
-function SpeakerButton({ text }: { text: string }) {
+function SpeakerButton({ text, voiceId }: { text: string; voiceId?: string | null }) {
   const [loading, setLoading] = useState(false);
 
   const speak = async () => {
@@ -177,7 +178,7 @@ function SpeakerButton({ text }: { text: string }) {
       const res = await fetch("/api/voice/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, ...(voiceId ? { voiceId } : {}) }),
       });
       if (res.ok) {
         const blob = await res.blob();
@@ -501,10 +502,14 @@ export function PlaygroundClient({ agents }: { agents: Agent[] }) {
     async (text: string) => {
       if (muted || !text) return;
       try {
+        const agent = selectedAgentRef.current;
         const res = await fetch("/api/voice/tts", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text }),
+          body: JSON.stringify({
+            text,
+            ...(agent?.voiceId ? { voiceId: agent.voiceId } : {}),
+          }),
         });
         if (!res.ok) return;
         const blob = await res.blob();
@@ -1013,7 +1018,7 @@ export function PlaygroundClient({ agents }: { agents: Agent[] }) {
                           {/* Per-message speaker button */}
                           {msg.content && (
                             <div className="flex items-center gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                              <SpeakerButton text={msg.content} />
+                              <SpeakerButton text={msg.content} voiceId={selectedAgent?.voiceId} />
                               <span className="text-[10px] text-[var(--muted-foreground)]">
                                 Listen
                               </span>
@@ -1070,7 +1075,8 @@ export function PlaygroundClient({ agents }: { agents: Agent[] }) {
               />
               <div className="flex items-center gap-2 flex-shrink-0">
                 <VoiceInputBtn
-                  onTranscript={(text) => sendMessage(text)}
+                  onTranscript={(text) => setInput((prev) => (prev ? prev + " " + text : text))}
+                  onInterim={(text) => { setInput((prev) => { const base = prev.replace(/ ?\[…\]$/, ""); return text ? (base ? base + " " + text + " […]" : text + " […]") : base; }); }}
                   disabled={!selectedAgent || streaming}
                 />
                 <Button

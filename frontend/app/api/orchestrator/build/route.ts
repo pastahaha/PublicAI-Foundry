@@ -28,6 +28,7 @@ export async function POST(req: NextRequest) {
       knowledge_base: body.knowledgeBase || {},
       use_case: body.use_case || undefined,
       model_provider: body.model_provider || "mistral",
+      voice_id: body.voiceId || undefined,
     };
 
     const res = await fetch(

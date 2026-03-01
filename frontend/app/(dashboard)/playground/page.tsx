@@ -7,7 +7,7 @@ export default async function PlaygroundPage() {
   const session = await getSession();
   if (!session) redirect("/login");
 
-  let agents: { id: string; name: string; description: string | null; model: string }[] = [];
+  let agents: { id: string; name: string; description: string | null; model: string; voiceId?: string | null }[] = [];
 
   try {
     const res = await fetch(`${getBackendUrl()}/api/v1/assistant/`, {
@@ -23,6 +23,7 @@ export default async function PlaygroundPage() {
           name: a.name as string,
           description: (a.description as string) ?? null,
           model: (config.model_name as string) || "mistral-large-latest",
+          voiceId: (config.voice_id as string) || null,
         };
       });
     }

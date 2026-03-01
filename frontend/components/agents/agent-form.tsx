@@ -7,7 +7,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { toast } from "sonner";
 import { motion } from "framer-motion";
-import { Save, ChevronRight, ChevronLeft, Eye, Shield, BookOpen, Upload, X, Globe, Sparkles } from "lucide-react";
+import { Save, ChevronRight, ChevronLeft, Eye, Shield, BookOpen, Upload, X, Globe, Sparkles, Volume2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -64,6 +64,7 @@ interface AgentFormProps {
     tools: string;
     guardrails: string;
     knowledgeBase?: string;
+    voiceId?: string | null;
   };
   /** When provided, a "Build with AI" button appears on the Review step */
   onBuildWithAI?: (prompt: string, useCase?: string) => void;
@@ -126,7 +127,7 @@ function buildOrchestratorPrompt({
   return parts.join("\n");
 }
 
-const STEPS = ["Basic Info", "Model", "System Prompt", "Tools", "Knowledge Base", "Guardrails", "Review"];
+const STEPS = ["Basic Info", "Model", "System Prompt", "Tools", "Knowledge Base", "Guardrails", "Voice", "Review"];
 
 const TEMPLATES: Record<string, { name: string; description: string; systemPrompt: string }> = {
   "Healthcare Assistant": {
@@ -455,6 +456,7 @@ export function AgentForm({ initial, onBuildWithAI }: AgentFormProps) {
   });
   const [urlInput, setUrlInput] = useState("");
   const [selectedTemplate, setSelectedTemplate] = useState<string | null>(null);
+  const [voiceId, setVoiceId] = useState<string | null>(initial?.voiceId || null);
 
   const { register, handleSubmit, setValue, watch, formState: { errors } } = useForm<FormData>({
     resolver: zodResolver(schema),
@@ -523,6 +525,13 @@ export function AgentForm({ initial, onBuildWithAI }: AgentFormProps) {
     setValue("systemPrompt", current ? `${current} ${text}` : text, { shouldValidate: true });
   };
 
+  const handleInterimTranscript = (text: string) => {
+    const current = watch("systemPrompt") || "";
+    const base = current.replace(/ ?\[…\]$/, "");
+    const next = text ? (base ? `${base} ${text} […]` : `${text} […]`) : base;
+    setValue("systemPrompt", next, { shouldValidate: true });
+  };
+
   const handleTemplateApply = (templateName: string) => {
     const tmpl = TEMPLATES[templateName];
     if (tmpl) {
@@ -562,6 +571,7 @@ export function AgentForm({ initial, onBuildWithAI }: AgentFormProps) {
           body: JSON.stringify({
             ...data,
             tools: selectedTools,
+            voiceId,
             guardrails: {
               toxicity: guardrails.toxicity,
               pii: guardrails.pii,
@@ -594,6 +604,7 @@ export function AgentForm({ initial, onBuildWithAI }: AgentFormProps) {
           body: JSON.stringify({
             ...data,
             tools: selectedTools,
+            voiceId,
             guardrails: {
               toxicity: guardrails.toxicity,
               pii: guardrails.pii,
@@ -799,8 +810,8 @@ export function AgentForm({ initial, onBuildWithAI }: AgentFormProps) {
                 <div className="flex items-center justify-between">
                   <Label className="text-sm text-[var(--foreground)]">Prompt *</Label>
                   <div className="flex items-center gap-2 text-xs text-[var(--muted-foreground)]">
-                    <VoiceInputBtn onTranscript={appendTranscript} />
-                    <span>Hold mic to speak</span>
+                    <VoiceInputBtn onTranscript={appendTranscript} onInterim={handleInterimTranscript} />
+                    <span>Speak to dictate</span>
                   </div>
                 </div>
                 <Textarea
@@ -1074,8 +1085,65 @@ export function AgentForm({ initial, onBuildWithAI }: AgentFormProps) {
             </>
           )}
 
-          {/* Step 6: Review */}
+          {/* Step 6: Voice */}
           {step === 6 && (
+            <>
+              <div>
+                <div className="flex items-center gap-2 mb-1">
+                  <Volume2 className="w-5 h-5 text-violet-400" />
+                  <h2 className="text-xl font-semibold text-[var(--foreground)]">Agent Voice</h2>
+                </div>
+                <p className="text-[var(--muted-foreground)] text-sm">
+                  Choose an ElevenLabs voice for your agent. When users interact with your agent in the playground, responses will be spoken in this voice. Leave as "Default" to use the voice set in your Settings.
+                </p>
+              </div>
+
+              <div className="space-y-3">
+                {[
+                  { id: null, name: "Default (from Settings)", description: "Uses the voice configured in your user settings" },
+                  { id: "21m00Tcm4TlvDq8ikWAM", name: "Rachel", description: "Warm, clear female voice — great for general assistants" },
+                  { id: "AZnzlk1XvdvUeBnXmlld", name: "Domi", description: "Young, strong female voice — energetic and articulate" },
+                  { id: "EXAVITQu4vr4xnSDxMaL", name: "Bella", description: "Soft, warm female voice — comforting and friendly" },
+                  { id: "ErXwobaYiN019PkySvjV", name: "Antoni", description: "Well-rounded male voice — conversational and confident" },
+                  { id: "MF3mGyEYCl7XYWbV9V6O", name: "Elli", description: "Youthful female voice — approachable and upbeat" },
+                  { id: "TxGEqnHWrfWFTfGW9XjX", name: "Josh", description: "Deep, warm male voice — authoritative and reassuring" },
+                  { id: "VR6AewLTigWG4xSOukaG", name: "Arnold", description: "Crisp, mature male voice — professional and direct" },
+                  { id: "pNInz6obpgDQGcFmaJgB", name: "Adam", description: "Deep male voice — calm and measured" },
+                  { id: "yoZ06aMxZJJ28mfd3POQ", name: "Sam", description: "Raspy, dynamic male voice — expressive and engaging" },
+                ].map((v) => (
+                  <button
+                    key={v.id || "default"}
+                    type="button"
+                    onClick={() => setVoiceId(v.id)}
+                    className={`w-full text-left p-4 rounded-xl border transition-all ${
+                      voiceId === v.id
+                        ? "border-violet-500 bg-violet-500/10"
+                        : "border-[var(--border)] hover:border-violet-500/40 hover:bg-violet-500/5"
+                    }`}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center flex-shrink-0 ${
+                        voiceId === v.id ? "border-violet-500 bg-violet-500" : "border-[var(--border)]"
+                      }`}>
+                        {voiceId === v.id && <div className="w-1.5 h-1.5 rounded-full bg-white" />}
+                      </div>
+                      <div>
+                        <p className="text-sm font-medium text-[var(--foreground)]">{v.name}</p>
+                        <p className="text-xs text-[var(--muted-foreground)]">{v.description}</p>
+                      </div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+
+              <p className="text-xs text-[var(--muted-foreground)] mt-2">
+                Voices are powered by <strong>ElevenLabs</strong>. An API key must be configured in Settings for voice to work.
+              </p>
+            </>
+          )}
+
+          {/* Step 7: Review */}
+          {step === 7 && (
             <>
               <div className="flex items-center gap-2 mb-1">
                 <Eye className="w-5 h-5 text-indigo-400" />
@@ -1090,6 +1158,7 @@ export function AgentForm({ initial, onBuildWithAI }: AgentFormProps) {
                   { label: "Model", value: watchedModel },
                   { label: "Tools", value: selectedTools.length > 0 ? selectedTools.join(", ") : "None" },
                   { label: "Guardrails", value: [guardrails.toxicity && "toxicity", guardrails.pii && "pii", guardrails.maxTokens && "maxTokens"].filter(Boolean).join(", ") || "None" },
+                  { label: "Voice", value: voiceId ? ["Rachel","Domi","Bella","Antoni","Elli","Josh","Arnold","Adam","Sam"][["21m00Tcm4TlvDq8ikWAM","AZnzlk1XvdvUeBnXmlld","EXAVITQu4vr4xnSDxMaL","ErXwobaYiN019PkySvjV","MF3mGyEYCl7XYWbV9V6O","TxGEqnHWrfWFTfGW9XjX","VR6AewLTigWG4xSOukaG","pNInz6obpgDQGcFmaJgB","yoZ06aMxZJJ28mfd3POQ"].indexOf(voiceId)] || voiceId : "Default" },
                 ].map((item) => (
                   <div key={item.label} className="flex gap-3 p-3 rounded-xl bg-[var(--accent)]">
                     <span className="text-sm text-[var(--muted-foreground)] w-24 flex-shrink-0">{item.label}</span>

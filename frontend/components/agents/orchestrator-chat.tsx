@@ -580,6 +580,7 @@ export function OrchestratorChat({ initialPrompt, initialUseCase }: Orchestrator
               className="flex-1 bg-transparent border-0 p-0 resize-none text-sm text-(--foreground) placeholder:text-(--muted-foreground) focus-visible:ring-0 max-h-32 overflow-y-auto" />
             <VoiceInputBtn
               onTranscript={(text) => { setInput((prev) => (prev ? prev + " " + text : text)); }}
+              onInterim={(text) => { setInput((prev) => { const base = prev.replace(/ ?\[…\]$/, ""); return text ? (base ? base + " " + text + " […]" : text + " […]") : base; }); }}
               disabled={loading}
             />
             <Button onClick={() => sendMessage(input)} disabled={!input.trim() || loading} size="sm"

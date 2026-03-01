@@ -99,6 +99,9 @@ export async function POST(req: NextRequest) {
   // ── Not authenticated ──────────────────────────────────────────────────────
   const session = await db.whatsAppSession.findUnique({ where: { phone } });
 
+  // Greetings anyone can send — show welcome / login prompt
+  const GREETINGS = ["hey", "hi", "hello", "start", "yo", "hola", "g'day"];
+
   if (!session) {
     if (lower.startsWith("login ")) {
       const parts = body.slice(6).trim().split(/\s+/);
@@ -122,10 +125,13 @@ export async function POST(req: NextRequest) {
       return twiml(`✅ Welcome, *${user.name}*!\n\n${MAIN_MENU}`);
     }
 
+    // Any greeting or unrecognised message → friendly welcome
     return twiml(
       `👋 Welcome to *PublicAI Foundry*!\n\n` +
-      `To get started, log in:\n` +
-      `*login your@email.com yourpassword*`
+      `Your AI agents, right here in WhatsApp.\n\n` +
+      `To get started, log in with your account:\n` +
+      `*login your@email.com yourpassword*\n\n` +
+      `_Don't have an account? Sign up at the platform first._`
     );
   }
 
@@ -146,6 +152,11 @@ export async function POST(req: NextRequest) {
 
   // ── STATE: main ────────────────────────────────────────────────────────────
   if (state === "main") {
+    // Greetings from logged-in users → show menu with friendly welcome back
+    if (GREETINGS.includes(lower)) {
+      return twiml(`👋 Hey, *${user.name}*!\n\n${MAIN_MENU}`);
+    }
+
     if (lower === "1") {
       // Resume existing agent if agentId is still set
       if (session.agentId) {

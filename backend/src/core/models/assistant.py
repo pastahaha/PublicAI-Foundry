@@ -16,6 +16,10 @@ class AssistantConfig(BaseModel):
     temperature: float = Field(0.7, description="LLM temperature")
     max_tokens: int = Field(4096, description="Maximum tokens for the response")
     tools: List[str] = Field(default_factory=list, description="Tool names to enable")
+    voice_id: Optional[str] = Field(
+        None,
+        description="ElevenLabs voice ID for TTS. If None, uses the user's default voice.",
+    )
 
 
 class CreateAssistantRequest(BaseModel):
