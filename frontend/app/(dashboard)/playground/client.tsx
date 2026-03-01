@@ -21,6 +21,7 @@ import {
   Pencil,
   Loader2,
   MessageSquare,
+  Wrench,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -39,9 +40,10 @@ interface Agent {
 
 interface Message {
   id: string;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "tool";
   content: string;
   timestamp: Date;
+  toolName?: string;
 }
 
 interface SessionMeta {
@@ -622,6 +624,56 @@ export function PlaygroundClient({ agents }: { agents: Agent[] }) {
               if (data === "[DONE]") break;
               try {
                 const parsed = JSON.parse(data);
+
+                // Handle greeting event — insert as a separate assistant message before the response
+                if (parsed.greeting) {
+                  const greetingId = crypto.randomUUID();
+                  setMessages((prev) => {
+                    // Insert greeting BEFORE the current empty assistant message
+                    const idx = prev.findIndex((m) => m.id === assistantId);
+                    if (idx === -1) return prev;
+                    const before = prev.slice(0, idx);
+                    const after = prev.slice(idx);
+                    return [
+                      ...before,
+                      {
+                        id: greetingId,
+                        role: "assistant" as const,
+                        content: parsed.greeting,
+                        timestamp: new Date(),
+                      },
+                      ...after,
+                    ];
+                  });
+                  if (sessionId) saveMessage(sessionId, "assistant", parsed.greeting);
+                  continue;
+                }
+
+                // Handle tool execution events — insert subtle tool status messages
+                if (parsed.tool_event) {
+                  const te = parsed.tool_event;
+                  const toolMsgId = crypto.randomUUID();
+                  setMessages((prev) => {
+                    // Insert tool event BEFORE the current assistant message
+                    const idx = prev.findIndex((m) => m.id === assistantId);
+                    if (idx === -1) return prev;
+                    const before = prev.slice(0, idx);
+                    const after = prev.slice(idx);
+                    return [
+                      ...before,
+                      {
+                        id: toolMsgId,
+                        role: "tool" as const,
+                        content: te.tool,
+                        toolName: te.tool,
+                        timestamp: new Date(),
+                      },
+                      ...after,
+                    ];
+                  });
+                  continue;
+                }
+
                 const delta =
                   parsed.choices?.[0]?.delta?.content || parsed.content || parsed.text || "";
                 if (delta) {
@@ -669,7 +721,7 @@ export function PlaygroundClient({ agents }: { agents: Agent[] }) {
       setMessages(
         full.messages.map((m) => ({
           id: m.id,
-          role: m.role as "user" | "assistant",
+          role: m.role as "user" | "assistant" | "tool",
           content: m.content,
           timestamp: new Date(m.createdAt),
         }))
@@ -924,41 +976,52 @@ export function PlaygroundClient({ agents }: { agents: Agent[] }) {
                   transition={{ duration: 0.25 }}
                   className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
                 >
-                  {msg.role === "assistant" && (
-                    <div className="w-7 h-7 rounded-lg bg-indigo-600/15 border border-indigo-500/20 flex items-center justify-center mr-2 flex-shrink-0 mt-0.5">
-                      <Bot className="w-3.5 h-3.5 text-indigo-400" />
-                    </div>
-                  )}
-
-                  {msg.role === "user" ? (
-                    <div className="max-w-[72%] rounded-2xl px-4 py-3 text-sm leading-relaxed bg-indigo-600 text-white rounded-tr-sm">
-                      {msg.content}
+                  {/* Tool execution event — subtle inline indicator */}
+                  {msg.role === "tool" ? (
+                    <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-400 text-[11px] font-medium">
+                      <Wrench className="w-3 h-3" />
+                      <span>{msg.toolName || msg.content}</span>
+                      <span className="text-amber-400/60">executed</span>
                     </div>
                   ) : (
-                    <div className="max-w-[72%] group">
-                      <div className="bg-[var(--card)] text-[var(--foreground)] border border-[var(--border)] rounded-2xl rounded-tl-sm px-4 py-3 text-sm">
-                        {msg.content ? (
-                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
-                            {msg.content}
-                          </ReactMarkdown>
-                        ) : (
-                          <span className="flex items-center gap-1.5 text-[var(--muted-foreground)]">
-                            <span className="thinking-dot w-1.5 h-1.5 bg-current rounded-full" />
-                            <span className="thinking-dot w-1.5 h-1.5 bg-current rounded-full" />
-                            <span className="thinking-dot w-1.5 h-1.5 bg-current rounded-full" />
-                          </span>
-                        )}
-                      </div>
-                      {/* Per-message speaker button */}
-                      {msg.content && (
-                        <div className="flex items-center gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                          <SpeakerButton text={msg.content} />
-                          <span className="text-[10px] text-[var(--muted-foreground)]">
-                            Listen
-                          </span>
+                    <>
+                      {msg.role === "assistant" && (
+                        <div className="w-7 h-7 rounded-lg bg-indigo-600/15 border border-indigo-500/20 flex items-center justify-center mr-2 flex-shrink-0 mt-0.5">
+                          <Bot className="w-3.5 h-3.5 text-indigo-400" />
                         </div>
                       )}
-                    </div>
+
+                      {msg.role === "user" ? (
+                        <div className="max-w-[72%] rounded-2xl px-4 py-3 text-sm leading-relaxed bg-indigo-600 text-white rounded-tr-sm">
+                          {msg.content}
+                        </div>
+                      ) : (
+                        <div className="max-w-[72%] group">
+                          <div className="bg-[var(--card)] text-[var(--foreground)] border border-[var(--border)] rounded-2xl rounded-tl-sm px-4 py-3 text-sm">
+                            {msg.content ? (
+                              <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
+                                {msg.content}
+                              </ReactMarkdown>
+                            ) : (
+                              <span className="flex items-center gap-1.5 text-[var(--muted-foreground)]">
+                                <span className="thinking-dot w-1.5 h-1.5 bg-current rounded-full" />
+                                <span className="thinking-dot w-1.5 h-1.5 bg-current rounded-full" />
+                                <span className="thinking-dot w-1.5 h-1.5 bg-current rounded-full" />
+                              </span>
+                            )}
+                          </div>
+                          {/* Per-message speaker button */}
+                          {msg.content && (
+                            <div className="flex items-center gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                              <SpeakerButton text={msg.content} />
+                              <span className="text-[10px] text-[var(--muted-foreground)]">
+                                Listen
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </>
                   )}
                 </motion.div>
               ))}

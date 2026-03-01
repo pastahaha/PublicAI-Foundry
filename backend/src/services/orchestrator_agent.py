@@ -30,11 +30,17 @@ import re as _re
 from src.core.models.orchestrator import GeneratedBlueprint, OrchestratorPhase
 from src.core.use_cases import (
     get_use_case,
+    get_use_case_sources_prompt,
+    get_use_case_sources_as_kb_configs,
 )
 from src.services.tool_catalogue import (
     get_all_tools_prompt,
     TOOL_NAMES,
     TOOL_REGISTRY,
+)
+from src.services.skill_catalogue import (
+    get_all_skills_level1_prompt,
+    SKILL_NAMES,
 )
 
 logger = logging.getLogger(__name__)
@@ -125,6 +131,16 @@ def _build_fallback_blueprint(state: dict) -> str:
                         "reason": "Explain complex documents and regulations",
                     },
                 ],
+                "skills": [
+                    {
+                        "id": "deep_research",
+                        "reason": "Thorough multi-source research with verification",
+                    },
+                    {
+                        "id": "step_by_step_guidance",
+                        "reason": "Clear step-by-step guidance for the user",
+                    },
+                ],
                 "temperature": 0.5,
                 "max_tokens": 4096,
             }
@@ -168,11 +184,13 @@ def _build_llm(
 
     if provider == "ollama":
         from langchain_ollama import ChatOllama
+        import os
 
         return ChatOllama(
             model=model,
             temperature=temperature,
             format=fmt,
+            base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         )
 
     # Default: mistral (cloud)
@@ -220,6 +238,7 @@ def _build_clarifier_prompt(use_case_id: str | None) -> str:
     """Build the clarifier system prompt, optionally scoped to a use-case."""
     uc = get_use_case(use_case_id) if use_case_id else None
     domain_hint = ""
+    sources_hint = ""
     if uc:
         domain_hint = (
             f"\n\nDOMAIN CONTEXT — {uc.name} ({uc.region}):\n"
@@ -227,43 +246,86 @@ def _build_clarifier_prompt(use_case_id: str | None) -> str:
             f"\nSuggested knowledge-base topics for this domain:\n"
             + "\n".join(f"  • {t}" for t in uc.suggested_kb_topics)
         )
+        # Let the clarifier know about curated sources
+        sources_prompt = get_use_case_sources_prompt(use_case_id)
+        if sources_prompt:
+            num_sources = sum(len(cat.sources) for cat in uc.reference_sources)
+            sources_hint = (
+                f"\n\nIMPORTANT: This use-case has {num_sources} pre-curated authoritative "
+                f"reference sources (government websites, service directories, etc.) that "
+                f"will be AUTOMATICALLY included in the agent's knowledge base. You do NOT "
+                f"need to ask the user about data sources or URLs — they are already provided."
+            )
 
     return f"""\
 You are an expert AI agent architect. The user wants to build a custom AI agent.
-Your job is to understand their use-case well enough to build it.
-{domain_hint}
+Your job is to understand their use-case quickly and efficiently.
+{domain_hint}{sources_hint}
+
+IMPORTANT PRINCIPLES:
+- Users of this platform are often NON-TECHNICAL (community workers, social workers,
+  public servants). Keep questions simple and jargon-free.
+- Be EFFICIENT — don't ask questions whose answers are already obvious from context.
+- If the user selected a use-case template (shown in DOMAIN CONTEXT above), you
+  ALREADY know the domain, region (NSW), target audience, and reference sources.
+  DO NOT re-ask about these.
+- Use the conversation history to avoid repeating questions the user already answered.
 
 Given the user's description, do ONE of the following:
-A) If you have a REASONABLE understanding of what the agent should do, respond with ONLY this JSON:
-   {{"status": "clear", "summary": "<one-paragraph summary of what the agent should do>"}}
 
-B) ONLY if the description is truly too vague to build anything useful (e.g. just "build me an agent"
-   with zero context), respond with ONLY this JSON:
-   {{"status": "needs_clarification", "questions": ["question 1", "question 2", ...], "partial_summary": "<what you understand so far>"}}
+A) If the user's message gives you enough to build a good agent (they described
+   the purpose, or they selected a use-case template), respond with ONLY this JSON:
+   {{"status": "clear", "summary": "<one-paragraph summary of what you'll build>"}}
+
+B) If critical information is genuinely missing AND cannot be inferred from the
+   use-case template or conversation history, ask AT MOST 1-2 SHORT questions.
+   Respond with ONLY this JSON:
+   {{"status": "needs_clarification", "questions": ["question 1"], "partial_summary": "<what you understand so far>"}}
+
+WHEN TO SKIP CLARIFICATION (respond "clear" immediately):
+- User selected a use-case template (healthcare, legal_aid, crisis_support, housing_crisis)
+- User's message is detailed (> 30 words describing what the agent should do)
+- User said something like "build me a healthcare agent" — the template provides all context
+- The domain context above already covers the audience, region, and knowledge sources
+
+WHEN TO ASK (max 1-2 questions):
+- User typed something very vague like "build me an agent" with no template selected
+- User described a custom agent outside the 4 templates and you need to know the specific domain
+
+QUESTION GUIDELINES (only if needed):
+- Keep questions SHORT and conversational (1 sentence each)
+- Ask about what's MISSING, not what's already obvious
+- Suggest answers in the question: "Should this focus on X or Y?"
+- Maximum 2 questions. Never ask 3 or more.
 
 CRITICAL RULES:
-- PREFER "clear" over "needs_clarification". If you can infer the purpose, mark it as clear.
-- Casual, short descriptions are FINE. "Help me with taxes" → clear (build a tax helper agent).
-- "Check my legalities" → clear (build a legal compliance agent).
-- "Customer support bot" → clear (build a customer support agent).
-- You do NOT need the user to specify exact tools, data sources, or technical details.
-  That is YOUR job as the architect — you will figure those out in the next step.
-- Only ask clarification if you genuinely cannot tell what DOMAIN or PURPOSE the agent is for.
-- Maximum 2-3 questions if you must ask. Keep them short and simple.
+- If DOMAIN CONTEXT is present above, the user selected a template — go straight to "clear".
+- If the conversation shows you already asked questions AND the user answered,
+  respond with "clear" and incorporate their answers.
 - Return ONLY valid JSON, no markdown, no explanation.
 """
 
 
 def _build_researcher_prompt(use_case_id: str | None) -> str:
-    """Build the researcher system prompt with ALL universal tools."""
+    """Build the researcher system prompt with ALL universal tools and skills."""
     tools_text = get_all_tools_prompt()
+    skills_text = get_all_skills_level1_prompt()
 
     uc = get_use_case(use_case_id) if use_case_id else None
     domain_hint = ""
+    sources_section = ""
     if uc:
         domain_hint = (
             f"\n\nDOMAIN CONTEXT — {uc.name} ({uc.region}):\n" f"{uc.system_context}\n"
         )
+        sources_text = get_use_case_sources_prompt(use_case_id)
+        if sources_text:
+            sources_section = (
+                f"\n{sources_text}\n"
+                f"IMPORTANT: These pre-curated sources MUST be included in the agent's "
+                f"knowledge_bases. They are authoritative government and service URLs "
+                f"verified for this domain. Recommend them in your research output.\n"
+            )
 
     return f"""\
 You are an AI agent architect researching the best approach to build a custom agent.
@@ -273,17 +335,26 @@ ALL tools are available to ALL use-cases — pick the ones that best fit this ta
 
 {tools_text}
 
+You also have these SKILLS — reusable capability modules that give agents
+specialised behaviour patterns.  Skills inject expert instructions into agent
+nodes so they perform tasks with higher accuracy:
+
+{skills_text}
+{sources_section}
 IMPORTANT RULES:
 - You MUST ONLY recommend tools from the 12 listed above.
 - The valid tool names are: {TOOL_NAMES}
-- Do NOT invent tools that are not in this list.
-- For EVERY tool you recommend, provide a REASON explaining why this tool is needed for this specific use-case.
+- The valid skill IDs are: {SKILL_NAMES}
+- Do NOT invent tools or skills that are not in these lists.
+- For EVERY tool you recommend, provide a REASON explaining why it is needed.
+- For EVERY skill you recommend, provide a REASON explaining why it is relevant.
 
 Given the user's use-case summary, determine:
 1. Which tools from the catalogue should be included (and WHY each one)
-2. What kind of graph topology is best (single LLM, multi-step pipeline, research loop, etc.)
-3. Whether knowledge bases / RAG are needed
-4. What system prompts each node should have
+2. Which skills should be attached to each node (and WHY each one)
+3. What kind of graph topology is best (single LLM, multi-step pipeline, research loop, etc.)
+4. Whether knowledge bases / RAG are needed
+5. What system prompts each node should have
 
 Respond with ONLY valid JSON:
 {{
@@ -291,16 +362,20 @@ Respond with ONLY valid JSON:
     {{"name": "tool_name_1", "reason": "Why this tool is needed for this task"}},
     {{"name": "tool_name_2", "reason": "Why this tool is needed for this task"}}
   ],
+  "recommended_skills": [
+    {{"id": "skill_id_1", "reason": "Why this skill is relevant for this agent"}},
+    {{"id": "skill_id_2", "reason": "Why this skill is relevant for this agent"}}
+  ],
   "topology": "single | pipeline | research_loop | multi_agent",
   "needs_knowledge_base": true/false,
   "knowledge_base_suggestions": ["description of KB 1", ...],
   "node_suggestions": [
-    {{"id": "node_id", "name": "Node Name", "type": "llm|tool|aggregator", "purpose": "what it does", "tools": [{{"name": "tool1", "reason": "why"}}], "system_prompt_hint": "brief prompt idea"}}
+    {{"id": "node_id", "name": "Node Name", "type": "llm|tool|aggregator", "purpose": "what it does", "tools": [{{"name": "tool1", "reason": "why"}}], "skills": [{{"id": "skill1", "reason": "why"}}], "system_prompt_hint": "brief prompt idea"}}
   ],
   "edge_suggestions": [
     {{"source": "node_a", "target": "node_b", "type": "direct|conditional", "condition": "optional condition"}}
   ],
-  "reasoning": "Explain your architecture decisions"
+  "reasoning": "Explain your architecture decisions including skill selections"
 }}
 """
 
@@ -311,12 +386,21 @@ def _build_planner_prompt(use_case_id: str | None) -> str:
     uc = get_use_case(use_case_id) if use_case_id else None
     domain_hint = ""
     use_case_field = ""
+    sources_section = ""
     if uc:
         domain_hint = (
             f"\n\nDOMAIN: {uc.name} ({uc.region})\n"
             f"DOMAIN CONTEXT: {uc.system_context}\n"
         )
         use_case_field = f'  "use_case": "{uc.id}",'
+        sources_text = get_use_case_sources_prompt(use_case_id)
+        if sources_text:
+            sources_section = (
+                f"\n{sources_text}\n"
+                f"CRITICAL: You MUST include ALL of these pre-curated reference sources "
+                f"in the blueprint's knowledge_bases array. Each source should be a "
+                f"knowledge_base entry with source_type: \"url\" and the URL as source_value.\n"
+            )
 
     return f"""\
 You are an AI agent blueprint generator.
@@ -325,14 +409,30 @@ Given research notes, generate a JSON blueprint for an AI agent.
 AVAILABLE TOOL NAMES (pick from these ONLY):
 {list(TOOL_REGISTRY.keys())}
 
+AVAILABLE SKILL IDs (attach relevant ones to nodes):
+{SKILL_NAMES}
+
+Skills are reusable capability modules that inject expert instructions into
+agent nodes.  When a skill is attached to a node, the agent follows the
+skill's patterns when handling relevant requests — improving accuracy.
+
 RULES:
 1. Return ONLY valid JSON — no markdown, no explanation, no code fences.
 2. Every node MUST have at least 1 tool from the list above.
-3. Use simple node IDs like "node_1", "node_2".
-4. Keep it simple: 1-3 nodes is usually enough.
-5. The "tools" array uses objects: {{"name": "tool_name", "reason": "why"}}.
-6. The "entry_point" must match a node's "id".
-7. Edge sources/targets must be valid node IDs or "__end__".
+3. Every node SHOULD have at least 1 skill if a relevant one exists.
+4. Use simple node IDs like "node_1", "node_2".
+5. Keep it simple: 1-3 nodes is usually enough.
+6. The "tools" array uses objects: {{"name": "tool_name", "reason": "why"}}.
+7. The "skills" array uses objects: {{"id": "skill_id", "reason": "why"}}.
+8. The "entry_point" must match a node's "id".
+9. Edge sources/targets must be valid node IDs or "__end__".
+10. Edge targets must ONLY be node IDs (node_1, node_2, …) or "__end__".
+    NEVER use tool names as edge targets.
+11. The FIRST node (entry_point) should be a general-purpose conversational
+    node that greets the user, understands their intent, and routes or
+    responds directly.  Think of it as the "main" node the user always
+    talks to.  It should have tools like web_search and summarize_text
+    so it can answer general questions on its own.
 
 HERE IS A COMPLETE EXAMPLE of a valid blueprint:
 {{
@@ -354,6 +454,10 @@ HERE IS A COMPLETE EXAMPLE of a valid blueprint:
         {{"name": "summarize_text", "reason": "Summarize complex tax documents for the user"}},
         {{"name": "document_explainer", "reason": "Explain tax forms and legal documents"}}
       ],
+      "skills": [
+        {{"id": "deep_research", "reason": "Ensure thorough multi-source tax research"}},
+        {{"id": "document_analysis", "reason": "Explain complex tax documents in plain language"}}
+      ],
       "temperature": 0.3,
       "max_tokens": 4096
     }}
@@ -368,7 +472,10 @@ HERE IS A COMPLETE EXAMPLE of a valid blueprint:
 
 NOW generate a blueprint for the user's use-case following this EXACT format.
 Replace the example values with values appropriate for the user's request.
-Make sure every node has relevant tools from the available list.
+IMPORTANT: Every node MUST have a "skills" array with at least 1-2 relevant skills.
+Pick skills that match the node's purpose from the available skill IDs.
+Make sure every node also has relevant tools from the available tool names.
+{sources_section}
 """
 
 
@@ -380,9 +487,16 @@ Evaluate it briefly:
 2. Does each node have at least one tool? (required)
 3. Does the entry_point match a node id? (required)
 4. Does the blueprint have a name and description? (required)
+5. Is the entry_point node a general conversational node that can greet the
+   user and handle basic questions? (required — the first node should NOT
+   be a narrow specialist; it should be the main conversational node)
+6. Do edges only target node IDs or "__end__"? (required — edge targets
+   must NEVER be tool names like "hotline_directory" or "human_review")
+7. Do nodes have relevant skills attached? (nice-to-have, not required)
 
-If ALL 4 checks pass, approve it. Do NOT reject for stylistic reasons.
+If checks 1-6 pass, approve it. Do NOT reject for stylistic reasons.
 Small, simple blueprints with 1-2 nodes are perfectly fine.
+If skills are missing but would be beneficial, note it as a suggestion but still approve.
 
 Respond with ONLY valid JSON:
 {
@@ -394,7 +508,7 @@ Respond with ONLY valid JSON:
   "reasoning": "Brief assessment"
 }
 
-Set is_approved to true if the 4 required checks pass. A score of 6+ should be approved.
+Set is_approved to true if the 6 required checks pass. A score of 6+ should be approved.
 """
 
 
@@ -426,12 +540,24 @@ async def clarifier_node(state: OrchestratorState) -> dict[str, Any]:
     logger.info("  🤖 Using: %s/%s  (use_case=%s)", provider, model, use_case or "none")
     logger.info("  📥 User request: %s", state["user_request"][:500])
     llm = _build_llm(provider, model, temperature=0.3)
-    response = await llm.ainvoke(
-        [
-            SystemMessage(content=_build_clarifier_prompt(use_case)),
-            HumanMessage(content=f"User's request:\n{state['user_request']}"),
-        ]
-    )
+
+    # Build conversation-aware prompt messages.
+    # If there's prior conversation history (user answered earlier questions),
+    # include it so the clarifier can see the full Q&A exchange.
+    existing_messages = state.get("messages", [])
+    prompt_messages: list = [SystemMessage(content=_build_clarifier_prompt(use_case))]
+
+    if len(existing_messages) > 1:
+        # We have a conversation history — include it for context
+        # so the clarifier sees the user's answers to previous questions
+        prompt_messages.extend(existing_messages)
+    else:
+        # First turn — just the user's request
+        prompt_messages.append(
+            HumanMessage(content=f"User's request:\n{state['user_request']}")
+        )
+
+    response = await llm.ainvoke(prompt_messages)
 
     try:
         data = json.loads(_repair_json(response.content))
@@ -736,6 +862,76 @@ async def finaliser_node(state: OrchestratorState) -> dict[str, Any]:
                         )
             node["tools"] = validated_tools
 
+        # ── Safety net: ensure entry_point node has basic conversational tools ──
+        entry_id = bp_data.get("entry_point")
+        _CONVERSATIONAL_TOOLS = {"web_search", "summarize_text"}
+        for node in bp_data.get("nodes", []):
+            if node.get("id") == entry_id:
+                existing_tool_names = {
+                    (t.get("name") if isinstance(t, dict) else t)
+                    for t in node.get("tools", [])
+                }
+                for tool_name in _CONVERSATIONAL_TOOLS:
+                    if tool_name not in existing_tool_names and tool_name in allowed_tools:
+                        node["tools"].append({
+                            "name": tool_name,
+                            "reason": "Auto-injected: entry node must support general conversation",
+                        })
+                        logger.info(
+                            "  🛡️ Injected '%s' into entry node '%s'",
+                            tool_name, entry_id,
+                        )
+                break  # found the entry node, no need to keep looping
+
+        # ── Repair knowledge_bases: LLM often outputs plain strings ──
+        raw_kbs = bp_data.get("knowledge_bases", [])
+        repaired_kbs = []
+        for kb in raw_kbs:
+            if isinstance(kb, str):
+                # Convert bare string to a proper KnowledgeBaseConfig dict
+                repaired_kbs.append({
+                    "name": kb,
+                    "description": kb,
+                    "source_type": "url",
+                    "source_value": "",
+                    "chunk_size": 500,
+                    "chunk_overlap": 50,
+                })
+                logger.info("  🔧 Repaired knowledge_base string → dict: '%s'", kb)
+            elif isinstance(kb, dict):
+                # Ensure required fields exist
+                kb.setdefault("name", kb.get("description", "Unnamed KB"))
+                kb.setdefault("description", kb.get("name", ""))
+                kb.setdefault("source_type", "url")
+                kb.setdefault("source_value", "")
+                repaired_kbs.append(kb)
+            # Skip anything else (None, numbers, etc.)
+
+        # ── Auto-inject curated reference sources for use-case templates ──
+        if use_case:
+            curated_kbs = get_use_case_sources_as_kb_configs(use_case)
+            if curated_kbs:
+                # Collect existing source_values to avoid duplicates
+                existing_urls = {
+                    kb.get("source_value", "").rstrip("/").lower()
+                    for kb in repaired_kbs
+                    if kb.get("source_value")
+                }
+                injected = 0
+                for ckb in curated_kbs:
+                    url_normalised = ckb["source_value"].rstrip("/").lower()
+                    if url_normalised not in existing_urls:
+                        repaired_kbs.append(ckb)
+                        existing_urls.add(url_normalised)
+                        injected += 1
+                logger.info(
+                    "  📚 Injected %d curated reference sources for use-case '%s' "
+                    "(%d total KBs)",
+                    injected, use_case, len(repaired_kbs),
+                )
+
+        bp_data["knowledge_bases"] = repaired_kbs
+
         blueprint = GeneratedBlueprint.model_validate(bp_data)
         clean_json = blueprint.model_dump_json(indent=2)
     except Exception as e:
@@ -798,15 +994,28 @@ async def finaliser_node(state: OrchestratorState) -> dict[str, Any]:
         )
 
         if needs_kb:
-            kb_text = "\n".join(kb_descriptions)
-            summary += (
-                f"**Knowledge Base Required:**\n{kb_text}\n\n"
-                f"This agent needs a knowledge base to work properly. "
-                f"Would you like to create the knowledge base now?\n"
-                f"- Reply **yes** to create it and upload documents\n"
-                f"- Reply **no** or **later** to skip for now (you can set it up later via the KB endpoints)\n"
-                f"- Reply **save** to just save the agent without a knowledge base"
-            )
+            kb_count = len(kb_descriptions)
+            # Show a compact summary instead of listing every URL
+            if kb_count > 8:
+                kb_preview = "\n".join(kb_descriptions[:5])
+                summary += (
+                    f"**📚 Knowledge Base: {kb_count} reference sources included**\n"
+                    f"{kb_preview}\n"
+                    f"  • ... and {kb_count - 5} more authoritative sources\n\n"
+                    f"These are pre-curated government and service URLs for this domain. "
+                    f"Would you like me to save the agent with all these sources?\n"
+                    f"- Reply **yes** or **save** to save the agent\n"
+                    f"- Reply **no** or **later** to skip for now"
+                )
+            else:
+                kb_text = "\n".join(kb_descriptions)
+                summary += (
+                    f"**📚 Knowledge Base: {kb_count} reference sources**\n{kb_text}\n\n"
+                    f"Would you like to create the knowledge base now?\n"
+                    f"- Reply **yes** to create it and upload documents\n"
+                    f"- Reply **no** or **later** to skip for now\n"
+                    f"- Reply **save** to just save the agent without a knowledge base"
+                )
         else:
             summary += (
                 "The agent has been designed and is ready to be saved. "

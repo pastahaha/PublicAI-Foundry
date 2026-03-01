@@ -15,6 +15,9 @@ from src.controllers.v1.orchestrator_controller import (
 from src.controllers.v1.orchestrator_chat_controller import (
     orchestrator_chat_router as v1_orchestrator_chat_router,
 )
+from src.controllers.v1.skills_controller import (
+    skills_router as v1_skills_router,
+)
 
 # Voice controller — disabled for now (requires elevenlabs dependency)
 # from src.controllers.v1.voice_controller import (
@@ -28,6 +31,7 @@ v1_router.include_router(v1_orchestrator_router)
 v1_router.include_router(v1_orchestrator_chat_router)
 v1_router.include_router(v1_kb_router)
 v1_router.include_router(v1_agent_chat_router)
+v1_router.include_router(v1_skills_router)
 # v1_router.include_router(v1_voice_router)  # Disabled until ElevenLabs is needed
 publicai_foundry_router.include_router(v1_router)
 publicai_foundry_router.include_router(health_router)

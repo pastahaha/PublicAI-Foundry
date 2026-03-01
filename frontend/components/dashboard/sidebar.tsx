@@ -7,7 +7,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
 import {
   LayoutDashboard, Bot, Plus, Gamepad2, Settings,
-  ChevronDown, LogOut, Menu, X, MessageCircle, PanelLeft,
+  ChevronDown, LogOut, Menu, X, MessageCircle, PanelLeft, Wrench,
 } from "lucide-react";
 import { Logo } from "@/components/Logo";
 import { cn } from "@/lib/utils";
@@ -26,6 +26,7 @@ const navItems = [
     children: [
       { label: "All Agents", href: "/agents" },
       { label: "Create Agent", href: "/agents/create" },
+      { label: "Manual Build", href: "/agents/manual" },
     ],
   },
   { label: "Playground", href: "/playground", icon: Gamepad2 },
@@ -140,6 +141,7 @@ export function Sidebar({ user }: SidebarProps) {
                             )}
                           >
                             {child.href === "/agents/create" && <Plus className="w-3.5 h-3.5" />}
+                            {child.href === "/agents/manual" && <Wrench className="w-3.5 h-3.5" />}
                             {child.label}
                           </Link>
                         ))}

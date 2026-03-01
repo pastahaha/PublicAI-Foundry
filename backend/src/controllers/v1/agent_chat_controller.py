@@ -65,6 +65,7 @@ class AgentChatResponse(BaseModel):
     thread_id: str
     run_id: str
     message: str = Field("", description="The agent's response")
+    greeting: str = Field("", description="Greeting message for new threads")
     messages: List[AgentChatMessage] = Field(
         default_factory=list,
         description="Full conversation history for this run",
@@ -72,6 +73,10 @@ class AgentChatResponse(BaseModel):
     tools_used: List[str] = Field(
         default_factory=list,
         description="Tools invoked during this run",
+    )
+    tool_events: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Detailed tool execution events from this run",
     )
     iterations: int = 0
     status: str = "completed"
@@ -134,6 +139,54 @@ def _build_system_prompt(config: dict, metadata: dict) -> str:
             )
 
     return "\n\n".join(sections)
+
+
+async def _generate_greeting(assistant: AssistantORM) -> str:
+    """Generate a greeting message for a new chat session with this agent."""
+    config = assistant.config or {}
+    bp_data = config.get("blueprint", {})
+    name = assistant.name or "Agent"
+    description = assistant.description or bp_data.get("description", "")
+    use_case = bp_data.get("use_case", "")
+    goal = bp_data.get("goal", "")
+
+    # Build a short context string for the LLM
+    context_parts = [f"Agent name: {name}"]
+    if description:
+        context_parts.append(f"Description: {description}")
+    if use_case:
+        context_parts.append(f"Use case domain: {use_case}")
+    if goal:
+        context_parts.append(f"Goal: {goal}")
+    context = "\n".join(context_parts)
+
+    try:
+        from langchain_mistralai import ChatMistralAI
+        from langchain_core.messages import SystemMessage, HumanMessage as HMsg
+
+        llm = ChatMistralAI(model="mistral-small-latest", temperature=0.7)
+        response = await llm.ainvoke([
+            SystemMessage(content=(
+                "You are generating a warm, concise greeting for an AI agent. "
+                "The greeting should:\n"
+                "- Introduce the agent by name\n"
+                "- Briefly mention what it can help with\n"
+                "- End with a friendly 'How can I help you today?' type question\n"
+                "- Be 2-3 sentences maximum\n"
+                "- Use a friendly, professional tone\n"
+                "- Use one relevant emoji\n"
+                "Output ONLY the greeting message, nothing else."
+            )),
+            HMsg(content=context),
+        ])
+        greeting = response.content.strip()
+        logger.info("👋 Generated greeting for '%s': %s", name, greeting[:100])
+        return greeting
+    except Exception as e:
+        logger.error("❌ Greeting generation failed: %s — using fallback", e)
+        if description:
+            return f"Hi! I'm **{name}** — {description}. How can I help you today? 👋"
+        return f"Hi! I'm **{name}**. How can I help you today? 👋"
 
 
 def _compile_assistant(assistant: AssistantORM) -> Any:
@@ -281,6 +334,17 @@ async def chat_with_agent(
         _agent_threads[thread_id] = []
 
     history = _agent_threads[thread_id]
+
+    # ── Generate greeting for new threads ────────────────────────────
+    greeting = ""
+    if is_new_thread:
+        try:
+            greeting = await _generate_greeting(assistant)
+            # Add greeting to history so the agent has context
+            history.append(AIMessage(content=greeting))
+        except Exception as e:
+            logger.error("❌ Greeting generation failed: %s", e)
+
     history.append(HumanMessage(content=req.message))
 
     # ── Run the graph ────────────────────────────────────────────────
@@ -302,18 +366,30 @@ async def chat_with_agent(
             "final_answer": "",
         }
 
-        # Run graph to completion
+        # Run graph to completion — track tool node executions
         last_state = initial_state.copy()
+        tool_events: List[Dict[str, Any]] = []
+
         async for event in graph.astream(initial_state, stream_mode="updates"):
             for node_name, node_output in event.items():
                 for k, v in node_output.items():
                     if k in last_state:
                         last_state[k] = v
+                # Detect tool node execution by checking for tool results in messages
+                node_messages = node_output.get("messages", [])
+                for m in node_messages:
+                    if isinstance(m, AIMessage) and m.content.startswith("Tool results:"):
+                        # Parse out which tools ran from the tool results prefix
+                        tool_events.append({
+                            "node": node_name,
+                            "type": "tool_execution",
+                            "status": "completed",
+                        })
 
-        # Extract the agent's response (last AI message)
+        # Extract the agent's response (last AI message, skip tool results)
         agent_response = ""
         for m in reversed(last_state.get("messages", [])):
-            if isinstance(m, AIMessage):
+            if isinstance(m, AIMessage) and not m.content.startswith("Tool results:"):
                 agent_response = m.content
                 break
 
@@ -321,7 +397,7 @@ async def chat_with_agent(
         if agent_response:
             history.append(AIMessage(content=agent_response))
 
-        # Extract tools used
+        # Extract tools used — combine static config + runtime events
         tools_used = []
         config = assistant.config or {}
         bp_data = config.get("blueprint", {})
@@ -331,6 +407,19 @@ async def chat_with_agent(
                     tname = t.get("name", t) if isinstance(t, dict) else t
                     if tname not in tools_used:
                         tools_used.append(tname)
+
+        # Build detailed tool events from blueprint tool nodes that were visited
+        visited_tool_nodes = {te["node"] for te in tool_events}
+        detailed_tool_events: List[Dict[str, Any]] = []
+        for node in bp_data.get("nodes", []):
+            if node.get("node_type") == "tool" and node["id"] in visited_tool_nodes:
+                for t in node.get("tools", []):
+                    tname = t.get("name", t) if isinstance(t, dict) else t
+                    detailed_tool_events.append({
+                        "tool": tname,
+                        "node": node["id"],
+                        "status": "completed",
+                    })
 
         # ── Save run to DB ───────────────────────────────────────────
         run = RunORM(
@@ -368,10 +457,11 @@ async def chat_with_agent(
                 conv_messages.append(AgentChatMessage(role="ai", content=m.content))
 
         logger.info(
-            "✅ Agent chat complete: thread=%s response=%d chars iterations=%d",
+            "✅ Agent chat complete: thread=%s response=%d chars iterations=%d tools=%d",
             thread_id,
             len(agent_response),
             last_state.get("iteration", 0),
+            len(detailed_tool_events),
         )
 
         return AgentChatResponse(
@@ -379,8 +469,10 @@ async def chat_with_agent(
             thread_id=thread_id,
             run_id=run_id,
             message=agent_response,
+            greeting=greeting,
             messages=conv_messages,
             tools_used=tools_used,
+            tool_events=detailed_tool_events,
             iterations=last_state.get("iteration", 0),
             status="completed",
         )

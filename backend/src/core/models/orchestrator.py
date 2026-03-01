@@ -61,6 +61,16 @@ class ToolSelection(BaseModel):
     )
 
 
+class SkillSelection(BaseModel):
+    """A skill selected for a node, with justification."""
+
+    id: str = Field(..., description="Skill identifier (from the skill catalogue)")
+    reason: str = Field(
+        "",
+        description="Why this skill is relevant for this node's task",
+    )
+
+
 class NodeBlueprint(BaseModel):
     """One node in the generated graph."""
 
@@ -74,6 +84,10 @@ class NodeBlueprint(BaseModel):
         default_factory=list,
         description="Tools wired to this node — each with a justification reason",
     )
+    skills: List[SkillSelection] = Field(
+        default_factory=list,
+        description="Skills attached to this node — each with a justification reason",
+    )
     temperature: float = 0.7
     max_tokens: int = 4096
 
@@ -81,6 +95,11 @@ class NodeBlueprint(BaseModel):
     def tool_names(self) -> List[str]:
         """Convenience — return just the tool name strings."""
         return [t.name for t in self.tools]
+
+    @property
+    def skill_ids(self) -> List[str]:
+        """Convenience — return just the skill ID strings."""
+        return [s.id for s in self.skills]
 
 
 class EdgeBlueprint(BaseModel):

@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server"
 import { getSession } from "@/lib/auth";
 import { getBackendUrl } from "@/lib/backend";
 
@@ -20,7 +20,7 @@ export async function POST(req: NextRequest) {
       message: body.message,
       thread_id: body.thread_id || undefined,
       use_case: body.use_case || undefined,
-      model_provider: "mistral",
+      model_provider: body.model_provider || "mistral",
       model_name: body.model_name || "mistral-large-latest",
     };
 

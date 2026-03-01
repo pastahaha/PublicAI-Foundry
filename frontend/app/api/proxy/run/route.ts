@@ -45,9 +45,12 @@ export async function POST(req: NextRequest) {
 
       const data = await res.json();
       const agentMsg: string = data.message || "(no response)";
+      const greeting: string = data.greeting || "";
+      const toolEvents: Array<{ tool: string; node: string; status: string }> =
+        data.tool_events || [];
 
       // Convert JSON response to SSE format expected by the playground client
-      return _jsonToSse(agentMsg);
+      return _jsonToSse(agentMsg, greeting, toolEvents);
     } catch (fetchErr: unknown) {
       clearTimeout(timeout);
       if (fetchErr instanceof Error && fetchErr.name === "AbortError") {
@@ -64,10 +67,29 @@ export async function POST(req: NextRequest) {
 }
 
 /** Wrap a text response as a minimal SSE stream the playground can parse */
-function _jsonToSse(text: string): NextResponse {
-  // Escape any embedded newlines so they don't break SSE framing
+function _jsonToSse(
+  text: string,
+  greeting: string = "",
+  toolEvents: Array<{ tool: string; node: string; status: string }> = []
+): NextResponse {
+  const lines: string[] = [];
+
+  // Send greeting as a separate SSE event if present
+  if (greeting) {
+    lines.push(`data: ${JSON.stringify({ greeting })}\n`);
+  }
+
+  // Send tool events as separate SSE events
+  for (const te of toolEvents) {
+    lines.push(`data: ${JSON.stringify({ tool_event: te })}\n`);
+  }
+
+  // Send the main content
   const payload = JSON.stringify({ content: text });
-  const body = `data: ${payload}\n\ndata: [DONE]\n\n`;
+  lines.push(`data: ${payload}\n`);
+  lines.push(`data: [DONE]\n`);
+
+  const body = lines.join("\n");
   return new NextResponse(body, {
     headers: {
       "Content-Type": "text/event-stream",
@@ -78,5 +100,5 @@ function _jsonToSse(text: string): NextResponse {
 }
 
 function _errorSse(message: string): NextResponse {
-  return _jsonToSse(`⚠️ ${message}`);
+  return _jsonToSse(`⚠️ ${message}`, "", []);
 }
