@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse, after } from "next/server";
 import { db } from "@/lib/db";
 import bcrypt from "bcryptjs";
 import { getBackendUrl } from "@/lib/backend";
@@ -46,6 +46,34 @@ async function fetchAgents(userId: string): Promise<BackendAgent[]> {
     });
   } catch {
     return [];
+  }
+}
+
+async function sendTwilioMessage(to: string, body: string) {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const apiKey = process.env.TWILIO_API_KEY;
+  const apiSecret = process.env.TWILIO_API_SECRET;
+  const fromNumber = process.env.NEXT_PUBLIC_TWILIO_WHATSAPP_NUMBER;
+  if (!accountSid || !apiKey || !apiSecret || !fromNumber) {
+    throw new Error("Twilio credentials not configured (TWILIO_ACCOUNT_SID, TWILIO_API_KEY, TWILIO_API_SECRET, NEXT_PUBLIC_TWILIO_WHATSAPP_NUMBER)");
+  }
+  const from = fromNumber.startsWith("whatsapp:") ? fromNumber : `whatsapp:${fromNumber}`;
+  const params = new URLSearchParams({ To: to, From: from, Body: body });
+  const res = await fetch(
+    `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
+    {
+      method: "POST",
+      headers: {
+        // API Key auth: key SID as username, key secret as password
+        Authorization: `Basic ${Buffer.from(`${apiKey}:${apiSecret}`).toString("base64")}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: params.toString(),
+    }
+  );
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Twilio API error: ${err}`);
   }
 }
 
@@ -232,14 +260,24 @@ export async function POST(req: NextRequest) {
     // Use a stable thread_id derived from phone + agentId
     const threadId = `wa-${phone.replace(/[^a-z0-9]/gi, "-")}-${session.agentId.slice(0, 8)}`;
 
-    let reply: string;
-    try {
-      reply = await chatWithAgent(session.agentId, user.id, body, threadId);
-    } catch {
-      return twiml("⚠️ Agent is temporarily unavailable. Please try again shortly.");
-    }
+    // Twilio has a 15-second webhook timeout. The agent can take longer,
+    // so we acknowledge immediately and send the reply asynchronously via
+    // the Twilio REST API once the agent finishes.
+    const agentId = session.agentId;
+    const userId = user.id;
+    const userFrom = from; // e.g. "whatsapp:+61..."
 
-    return twiml(`${reply}\n\n_(Reply *0* for menu)_`);
+    after(async () => {
+      try {
+        const reply = await chatWithAgent(agentId, userId, body, threadId);
+        await sendTwilioMessage(userFrom, `${reply}\n\n_(Reply *0* for menu)_`);
+      } catch (err) {
+        console.error("[WhatsApp] Agent chat error:", err);
+        await sendTwilioMessage(userFrom, "⚠️ Agent is temporarily unavailable. Please try again shortly.").catch(() => {});
+      }
+    });
+
+    return twiml("⏳ Got it! Processing your message — I'll reply in a moment.");
   }
 
   // ── STATE: account ─────────────────────────────────────────────────────────
