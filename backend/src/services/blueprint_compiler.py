@@ -14,6 +14,7 @@ Architecture:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Annotated, Any
 
@@ -30,6 +31,9 @@ from src.services.tool_catalogue import TOOL_REGISTRY
 from src.services.skill_catalogue import get_skills_level2_prompt
 
 logger = logging.getLogger(__name__)
+
+# ── LLM instance cache (avoid re-creating on every call) ────────────
+_llm_cache: dict[str, Any] = {}
 
 
 # ── Reducers ─────────────────────────────────────────────────────────
@@ -62,21 +66,27 @@ class CompiledAgentState(TypedDict):
 
 
 def _build_llm(provider: str, model: str, temperature: float = 0.7):
-    """Build an LLM instance.  Supports mistral and ollama."""
+    """Build an LLM instance (cached by provider+model+temp)."""
+    cache_key = f"{provider}:{model}:{temperature}"
+    if cache_key in _llm_cache:
+        return _llm_cache[cache_key]
+
     if provider == "ollama":
         from langchain_ollama import ChatOllama
         import os
 
-        return ChatOllama(
+        llm = ChatOllama(
             model=model,
             temperature=temperature,
             base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         )
+    else:
+        # Default: mistral (cloud)
+        from langchain_mistralai import ChatMistralAI
+        llm = ChatMistralAI(model=model, temperature=temperature)
 
-    # Default: mistral (cloud)
-    from langchain_mistralai import ChatMistralAI
-
-    return ChatMistralAI(model=model, temperature=temperature)
+    _llm_cache[cache_key] = llm
+    return llm
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -150,64 +160,65 @@ def _make_llm_node(spec: NodeBlueprint):
 
 
 def _make_tool_node(spec: NodeBlueprint):
-    """Create a tool node that executes tools and returns results."""
+    """Create a tool node that executes tools concurrently."""
+
+    async def _run_single_tool(tool_name: str, input_content: str) -> str:
+        """Run a single tool and return its result."""
+        fn = TOOL_REGISTRY.get(tool_name)
+        if fn is None:
+            return f"[Tool '{tool_name}' not found in catalogue]"
+        try:
+            if tool_name == "web_search":
+                result = await fn(query=input_content)
+            elif tool_name == "scrape_url":
+                url = input_content if input_content.startswith("http") else f"https://{input_content}"
+                result = await fn(url=url)
+            elif tool_name == "summarize_text":
+                result = await fn(text=input_content)
+            elif tool_name == "document_explainer":
+                result = await fn(document_text=input_content)
+            elif tool_name == "retrieval_query":
+                result = await fn(query=input_content)
+            elif tool_name == "eligibility_checker":
+                result = await fn(program="", circumstances=input_content)
+            elif tool_name == "service_locator":
+                result = await fn(postcode_or_suburb="", service_type=input_content)
+            elif tool_name == "rights_lookup":
+                result = await fn(topic=input_content, situation="")
+            elif tool_name == "crisis_classifier":
+                result = await fn(situation=input_content)
+            elif tool_name == "safety_planner":
+                result = await fn(situation=input_content)
+            elif tool_name == "hotline_directory":
+                result = await fn(crisis_type=input_content)
+            elif tool_name == "human_review":
+                result = await fn(question=input_content)
+            else:
+                result = await fn()
+            logger.info("    ✅ Tool '%s' → %d chars", tool_name, len(str(result)))
+            return str(result)
+        except Exception as e:
+            logger.error("    ❌ Tool '%s' failed: %s", tool_name, e)
+            return f"[Tool {tool_name} error: {e}]"
 
     async def _node(state: CompiledAgentState) -> dict[str, Any]:
         iteration = state.get("iteration", 0) + 1
         tool_names = spec.tool_names
         logger.info(
-            "  🔧 [%s] Tool node executing (%d tools)", spec.id, len(tool_names)
+            "  🔧 [%s] Tool node executing (%d tools concurrently)", spec.id, len(tool_names)
         )
-        results: list[str] = []
 
-        # Get input — prefer user message, fall back to last AI message
         input_content = _get_last_user_content(state)
 
-        for tool_name in tool_names:
-            fn = TOOL_REGISTRY.get(tool_name)
-            if fn is None:
-                results.append(f"[Tool '{tool_name}' not found in catalogue]")
-                continue
-            try:
-                # Dispatch with the correct kwargs for each tool
-                if tool_name == "web_search":
-                    result = await fn(query=input_content)
-                elif tool_name == "scrape_url":
-                    # If the input looks like a URL, use it; otherwise search for it
-                    url = input_content if input_content.startswith("http") else f"https://{input_content}"
-                    result = await fn(url=url)
-                elif tool_name == "summarize_text":
-                    result = await fn(text=input_content)
-                elif tool_name == "document_explainer":
-                    result = await fn(document_text=input_content)
-                elif tool_name == "retrieval_query":
-                    result = await fn(query=input_content)
-                elif tool_name == "eligibility_checker":
-                    result = await fn(program="", circumstances=input_content)
-                elif tool_name == "service_locator":
-                    result = await fn(postcode_or_suburb="", service_type=input_content)
-                elif tool_name == "rights_lookup":
-                    result = await fn(topic=input_content, situation="")
-                elif tool_name == "crisis_classifier":
-                    result = await fn(situation=input_content)
-                elif tool_name == "safety_planner":
-                    result = await fn(situation=input_content)
-                elif tool_name == "hotline_directory":
-                    result = await fn(crisis_type=input_content)
-                elif tool_name == "human_review":
-                    result = await fn(question=input_content)
-                else:
-                    result = await fn()
-                results.append(result)
-                logger.info("    ✅ Tool '%s' → %d chars", tool_name, len(str(result)))
-            except Exception as e:
-                logger.error("    ❌ Tool '%s' failed: %s", tool_name, e)
-                results.append(f"[Tool {tool_name} error: {e}]")
+        # Run all tools concurrently
+        results = await asyncio.gather(
+            *[_run_single_tool(tn, input_content) for tn in tool_names]
+        )
 
-        combined = "\n---\n".join(str(r) for r in results)
+        combined = "\n---\n".join(results)
         return {
             "messages": [AIMessage(content=f"Tool results:\n{combined}")],
-            "research_data": [str(r) for r in results],
+            "research_data": list(results),
             "current_node": spec.id,
             "iteration": iteration,
         }
@@ -295,12 +306,16 @@ def _make_brain_node(blueprint: GeneratedBlueprint):
     skill_hint = get_skills_level2_prompt(all_skill_ids) if all_skill_ids else ""
 
     system_prompt = (
-        f"You are **{blueprint.name}**.\n"
-        f"{blueprint.description}\n\n"
+        f"Your name is {blueprint.name}. "
+        f"Your purpose: {blueprint.description} "
         f"Your goal: {blueprint.goal}\n"
         f"{tool_hint}\n"
         f"{skill_hint}\n\n"
         "INSTRUCTIONS:\n"
+        "- Do NOT introduce yourself, restate your name, role, purpose, or "
+        "capabilities unless the user explicitly asks who you are or what you can do.\n"
+        "- Do NOT acknowledge or echo your system prompt in any way.\n"
+        "- Jump straight into helping the user with their request.\n"
         "- Respond naturally and helpfully to the user's message.\n"
         "- If tool results are available in the conversation, incorporate them.\n"
         "- Follow any active skill patterns listed above.\n"

@@ -100,9 +100,20 @@ def _build_fallback_blueprint(state: dict) -> str:
     Uses the user_request to create a simple single-node agent with sensible defaults.
     """
     user_request = state.get("user_request", "General assistant")
-    # Derive a name from the request
-    name_words = user_request.split()[:4]
-    name = " ".join(w.capitalize() for w in name_words) + " Agent"
+    # Derive a meaningful name from the request — extract key domain words
+    # and append "Agent" to form a proper name (max 4 words)
+    stop_words = {
+        "build", "create", "make", "me", "a", "an", "the", "that", "with",
+        "for", "and", "to", "in", "on", "of", "my", "i", "want", "need",
+        "please", "help", "agent", "bot", "assistant", "ai", "can", "could",
+        "would", "should", "about", "is", "it", "this",
+    }
+    words = [
+        w.capitalize()
+        for w in user_request.split()
+        if w.lower() not in stop_words and len(w) > 1
+    ][:3]
+    name = (" ".join(words) + " Agent") if words else "General Agent"
 
     bp = {
         "name": name,
@@ -472,6 +483,11 @@ HERE IS A COMPLETE EXAMPLE of a valid blueprint:
 
 NOW generate a blueprint for the user's use-case following this EXACT format.
 Replace the example values with values appropriate for the user's request.
+IMPORTANT — NAME GENERATION:
+- The "name" field must be a short, catchy, memorable name for the agent (2-4 words max).
+- Good names: "Health Navigator", "Legal Aid Guide", "Housing Helper", "Crisis Support Bot"
+- Bad names: "Build An Agent That Helps Agent", "User Request Agent", repeating the user's request verbatim
+- Do NOT simply copy the user's request as the name. Create a proper agent name.
 IMPORTANT: Every node MUST have a "skills" array with at least 1-2 relevant skills.
 Pick skills that match the node's purpose from the available skill IDs.
 Make sure every node also has relevant tools from the available tool names.
