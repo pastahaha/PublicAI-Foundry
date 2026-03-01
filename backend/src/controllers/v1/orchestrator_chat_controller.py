@@ -21,6 +21,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -30,11 +31,14 @@ from datetime import datetime
 
 from pytz import UTC
 from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Any, Dict, Optional
+
+from src.core.sse import format_sse_message, get_sse_headers
 
 from src.core.models.orchestrator import (
     GeneratedBlueprint,
@@ -240,31 +244,56 @@ _YES_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 _NO_PATTERNS = re.compile(
-    r"^\s*(no|nah|nope|skip|later|not now|cancel)\s*$",
+    r"^\s*(no+|nah+|nope|skip|later|not\s*now|cancel|don'?t|nah+\s+later|no\s+thanks?|not\s+yet|maybe\s+later|skip\s+it)\s*[.!]?\s*$",
     re.IGNORECASE,
 )
 
 
-def _extract_agent_name(message: str) -> str | None:
-    """Try to extract an agent name from user message.
+async def _extract_agent_name(message: str) -> str | None:
+    """Extract an agent name from user message using an LLM.
 
-    Handles patterns like:
+    Handles natural language like:
       - "call it Customer Bot"
-      - "name it Support Agent"
+      - "yes, call it Housing Bot"
       - "My Helper Agent"
       - Just a plain name string
+
+    Returns None for rejection phrases like "nah later", "no thanks", etc.
     """
-    # Strip known prefixes
-    cleaned = re.sub(
-        r"^(call it|name it|name:?|let'?s call it|save (?:it )?as)\s+",
-        "",
-        message.strip(),
-        flags=re.IGNORECASE,
-    )
-    cleaned = cleaned.strip().strip("\"'")
-    if cleaned and len(cleaned) <= 100:
-        return cleaned
-    return None
+    # Fast pre-check: reject phrases never contain a name
+    if _is_rejection(message):
+        return None
+
+    try:
+        from langchain_mistralai import ChatMistralAI
+        from langchain_core.messages import SystemMessage, HumanMessage as HMsg
+
+        llm = ChatMistralAI(model="mistral-small-latest", temperature=0.0)
+        response = await llm.ainvoke([
+            SystemMessage(content=(
+                "You are a name extractor. The user has been asked to provide a name for their AI agent.\n"
+                "Extract ONLY the agent name from their message. Rules:\n"
+                "- Return ONLY the name, nothing else — no quotes, no explanation.\n"
+                "- If the user says something like 'call it X' or 'name it X' or 'yes, X', extract X.\n"
+                "- If the entire message IS a name (e.g. 'Support Bot'), return it as-is.\n"
+                "- If the user is declining/rejecting (e.g. 'no', 'nah', 'skip'), return exactly: NONE\n"
+                "- If you cannot find a clear name, return exactly: NONE\n"
+                "- The name should be 1-100 characters.\n"
+            )),
+            HMsg(content=message.strip()),
+        ])
+        extracted = response.content.strip().strip("\"'")
+        if not extracted or extracted.upper() == "NONE" or len(extracted) > 100:
+            return None
+        logger.info("🏷️  LLM extracted agent name: '%s' from '%s'", extracted, message[:80])
+        return extracted
+    except Exception as e:
+        logger.error("❌ LLM name extraction failed: %s — falling back to raw message", e)
+        # Simple fallback: just return the message itself if it's short enough
+        cleaned = message.strip().strip("\"'")
+        if cleaned and len(cleaned) <= 100 and not _is_rejection(cleaned):
+            return cleaned
+        return None
 
 
 def _is_confirmation(msg: str) -> bool:
@@ -579,6 +608,11 @@ async def orchestrator_chat(
         )
         seq += 1
 
+        # If we're still in the clarifying phase, feed the user's answers
+        # back to the clarifier so it can decide if it has enough info.
+        # Only skip clarification when the clarifier itself said "clear".
+        still_clarifying = current_phase == "clarifying"
+
         enriched_request = (
             f"{prev_state.get('user_request', '')}\n\n"
             f"Additional details from user:\n{user_msg}"
@@ -592,13 +626,13 @@ async def orchestrator_chat(
             or prev_state.get("model_provider", "mistral"),
             "model_name": req.model_name or prev_state.get("model_name", "mistral-large-latest"),
             "use_case": req.use_case or prev_state.get("use_case", ""),
-            "skip_clarification": True,
+            "skip_clarification": not still_clarifying,
             "phase": OrchestratorPhase.CLARIFYING.value,
             "clarification_questions": [],
-            "research_notes": prev_state.get("research_notes", ""),
-            "blueprint_json": prev_state.get("blueprint_json", ""),
-            "review_feedback": prev_state.get("review_feedback", ""),
-            "review_loop": prev_state.get("review_loop", 0),
+            "research_notes": prev_state.get("research_notes", "") if not still_clarifying else "",
+            "blueprint_json": prev_state.get("blueprint_json", "") if not still_clarifying else "",
+            "review_feedback": prev_state.get("review_feedback", "") if not still_clarifying else "",
+            "review_loop": prev_state.get("review_loop", 0) if not still_clarifying else 0,
             "is_approved": False,
             "final_blueprint": "",
         }
@@ -633,6 +667,272 @@ async def orchestrator_chat(
         raise HTTPException(status_code=500, detail=f"Orchestrator failed: {e}")
 
 
+# ── POST /orchestrator/chat/stream — SSE streaming endpoint ─────────
+
+
+async def _stream_orchestrator(initial_state: OrchestratorState):
+    """Run the orchestrator graph and yield SSE events for each node transition."""
+    graph = build_orchestrator_graph()
+    last_state = initial_state.copy()
+    async for event in graph.astream(initial_state, stream_mode="updates"):
+        for node_name, node_output in event.items():
+            for k, v in node_output.items():
+                if k in last_state:
+                    last_state[k] = v
+            yield node_name, last_state.copy()
+
+
+@orchestrator_chat_router.post("/chat/stream")
+async def orchestrator_chat_stream(
+    req: ChatRequest,
+    session: AsyncSession = Depends(get_session),
+    user_id: str = Header("system", alias="X-User-Id"),
+):
+    """SSE streaming version of ``/orchestrator/chat``.
+
+    Streams real-time phase updates as the orchestrator works through
+    clarify → research → plan → review → finalise.
+
+    Supports ``model_provider: "ollama"`` for local LLM inference.
+
+    **SSE Events:**
+      - ``phase``     — ``{ phase, node, message? }``
+      - ``blueprint`` — ``{ blueprint }``
+      - ``done``      — full ``ChatResponse`` dict
+      - ``error``     — ``{ error }``
+    """
+    thread_id = req.thread_id
+    user_msg = req.message.strip()
+    now = datetime.now(UTC)
+
+    async def event_generator():
+        nonlocal thread_id
+
+        try:
+            # ── New conversation ─────────────────────────────────────
+            if not thread_id:
+                thread_id = str(uuid4())
+
+                yield format_sse_message("phase", {
+                    "phase": "started",
+                    "node": "init",
+                    "message": "Starting orchestrator session…",
+                    "thread_id": thread_id,
+                })
+
+                thread = ThreadORM(
+                    thread_id=thread_id,
+                    status="orchestrating",
+                    metadata_json={
+                        "type": "orchestrator_chat",
+                        "model_provider": req.model_provider,
+                        "model_name": req.model_name,
+                        "use_case": req.use_case or "",
+                    },
+                    user_id=user_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(thread)
+                await session.commit()
+
+                initial_state: OrchestratorState = {
+                    "messages": [HumanMessage(content=user_msg)],
+                    "user_request": user_msg,
+                    "model_provider": req.model_provider,
+                    "model_name": req.model_name,
+                    "use_case": req.use_case or "",
+                    "skip_clarification": False,
+                    "phase": OrchestratorPhase.CLARIFYING.value,
+                    "clarification_questions": [],
+                    "research_notes": "",
+                    "blueprint_json": "",
+                    "review_feedback": "",
+                    "review_loop": 0,
+                    "is_approved": False,
+                    "final_blueprint": "",
+                }
+
+                final_state = initial_state.copy()
+                async for node_name, state in _stream_orchestrator(initial_state):
+                    phase = state.get("phase", "unknown")
+                    ai_msg = _get_last_ai_message(state)
+                    final_state = state
+
+                    yield format_sse_message("phase", {
+                        "phase": phase,
+                        "node": node_name,
+                        "message": ai_msg[:500] if ai_msg else None,
+                    })
+
+                    bp = _get_blueprint_dict(state)
+                    if bp:
+                        yield format_sse_message("blueprint", {"blueprint": bp})
+
+                _sessions[thread_id] = final_state
+                _thread_meta[thread_id] = {
+                    "controller_phase": final_state.get("phase", "clarifying")
+                }
+
+                seq = 1
+                await _save_message(
+                    session=session, thread_id=thread_id, role="human",
+                    content=user_msg, phase="chat", seq=seq,
+                )
+                seq += 1
+                ai_msg = _get_last_ai_message(final_state)
+                await _save_message(
+                    session=session, thread_id=thread_id, role="ai",
+                    content=ai_msg,
+                    phase=final_state.get("phase", "unknown"),
+                    seq=seq, state_snapshot=_serialise_state(final_state),
+                )
+                thread_obj = await session.get(ThreadORM, thread_id)
+                if thread_obj:
+                    thread_obj.status = final_state.get("phase", "unknown")
+                    thread_obj.updated_at = datetime.now(UTC)
+                await session.commit()
+
+                resp = _build_response(thread_id, final_state)
+                yield format_sse_message("done", resp.model_dump())
+
+            else:
+                # ── Continue existing conversation ───────────────────
+                prev_state = _sessions.get(thread_id)
+                if not prev_state:
+                    prev_state = await _restore_state_from_db(thread_id, session)
+                    if prev_state:
+                        _sessions[thread_id] = prev_state
+
+                if not prev_state:
+                    yield format_sse_message("error", {
+                        "error": f"Thread '{thread_id}' not found.",
+                    })
+                    return
+
+                current_phase = _thread_meta.get(thread_id, {}).get(
+                    "controller_phase"
+                ) or prev_state.get("phase", "")
+
+                # Save-flow phases (no graph streaming needed)
+                if current_phase == "awaiting_name":
+                    result = await _handle_naming(
+                        thread_id, user_msg, prev_state, session, user_id=user_id,
+                    )
+                    yield format_sse_message("done", result.model_dump())
+                    return
+
+                if current_phase in ("finalised", "kb_confirm"):
+                    result = await _handle_save_decision(
+                        thread_id, user_msg, prev_state, session, user_id=user_id,
+                    )
+                    yield format_sse_message("done", result.model_dump())
+                    return
+
+                if current_phase == "saved":
+                    meta = _thread_meta.get(thread_id, {})
+                    aid = meta.get("assistant_id", "")
+                    resp = ChatResponse(
+                        thread_id=thread_id, phase="saved",
+                        message=f"This agent has already been saved! 🎉\n\nChat with your agent: `POST /api/v1/agent/{aid}/chat`",
+                        assistant_id=aid,
+                        agent_chat_url=f"/api/v1/agent/{aid}/chat" if aid else None,
+                        next_action="chat_with_agent",
+                    )
+                    yield format_sse_message("done", resp.model_dump())
+                    return
+
+                # Run the graph with streaming
+                yield format_sse_message("phase", {
+                    "phase": "continuing",
+                    "node": "init",
+                    "message": "Processing your response…",
+                })
+
+                seq = await _next_seq(thread_id, session)
+                await _save_message(
+                    session=session, thread_id=thread_id, role="human",
+                    content=user_msg, phase="chat", seq=seq,
+                )
+                seq += 1
+
+                # If still in clarifying phase, let the clarifier re-evaluate
+                # instead of skipping straight to research
+                still_clarifying = current_phase == "clarifying"
+
+                enriched_request = (
+                    f"{prev_state.get('user_request', '')}\n\n"
+                    f"Additional details from user:\n{user_msg}"
+                )
+
+                continued_state: OrchestratorState = {
+                    "messages": list(prev_state.get("messages", []))
+                    + [HumanMessage(content=user_msg)],
+                    "user_request": enriched_request,
+                    "model_provider": req.model_provider
+                    or prev_state.get("model_provider", "mistral"),
+                    "model_name": req.model_name
+                    or prev_state.get("model_name", "mistral-large-latest"),
+                    "use_case": req.use_case or prev_state.get("use_case", ""),
+                    "skip_clarification": not still_clarifying,
+                    "phase": OrchestratorPhase.CLARIFYING.value,
+                    "clarification_questions": [],
+                    "research_notes": prev_state.get("research_notes", "") if not still_clarifying else "",
+                    "blueprint_json": prev_state.get("blueprint_json", "") if not still_clarifying else "",
+                    "review_feedback": prev_state.get("review_feedback", "") if not still_clarifying else "",
+                    "review_loop": prev_state.get("review_loop", 0) if not still_clarifying else 0,
+                    "is_approved": False,
+                    "final_blueprint": "",
+                }
+
+                final_state = continued_state.copy()
+                async for node_name, state in _stream_orchestrator(continued_state):
+                    phase = state.get("phase", "unknown")
+                    ai_msg = _get_last_ai_message(state)
+                    final_state = state
+
+                    yield format_sse_message("phase", {
+                        "phase": phase,
+                        "node": node_name,
+                        "message": ai_msg[:500] if ai_msg else None,
+                    })
+
+                    bp = _get_blueprint_dict(state)
+                    if bp:
+                        yield format_sse_message("blueprint", {"blueprint": bp})
+
+                _sessions[thread_id] = final_state
+                _thread_meta[thread_id] = {
+                    "controller_phase": final_state.get("phase", "unknown")
+                }
+
+                ai_msg = _get_last_ai_message(final_state)
+                await _save_message(
+                    session=session, thread_id=thread_id, role="ai",
+                    content=ai_msg,
+                    phase=final_state.get("phase", "unknown"),
+                    seq=seq, state_snapshot=_serialise_state(final_state),
+                )
+                thread_obj = await session.get(ThreadORM, thread_id)
+                if thread_obj:
+                    thread_obj.status = final_state.get("phase", "unknown")
+                    thread_obj.updated_at = datetime.now(UTC)
+                await session.commit()
+
+                resp = _build_response(thread_id, final_state)
+                yield format_sse_message("done", resp.model_dump())
+
+        except Exception as e:
+            logger.error("❌ Stream failed: %s\n%s", e, traceback.format_exc())
+            yield format_sse_message("error", {"error": str(e)})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers=get_sse_headers(),
+    )
+
+
 # ── Save-decision handler ───────────────────────────────────────────
 
 
@@ -643,7 +943,16 @@ async def _handle_save_decision(
     session: AsyncSession,
     user_id: str = "system",
 ) -> ChatResponse:
-    """User has seen the blueprint. Did they say yes, no, or give a name?"""
+    """User has seen the blueprint. Did they say yes, no, or give a name?
+
+    In the ``kb_confirm`` phase, a rejection means "skip the KB" but
+    still save.  In the ``finalised`` phase, a rejection means
+    "don't save at all".
+    """
+
+    current_phase = _thread_meta.get(thread_id, {}).get(
+        "controller_phase"
+    ) or state.get("phase", "finalised")
 
     seq = await _next_seq(thread_id, session)
     await _save_message(
@@ -655,6 +964,44 @@ async def _handle_save_decision(
         seq=seq,
     )
     seq += 1
+
+    # ── kb_confirm phase: rejection means "skip KB, still save" ──────
+    if current_phase == "kb_confirm" and _is_rejection(user_msg):
+        # Strip knowledge_bases from the blueprint so the save won't create a KB
+        bp_json = state.get("final_blueprint", "")
+        try:
+            bp_data = json.loads(bp_json)
+            bp_data["knowledge_bases"] = []
+            state["final_blueprint"] = json.dumps(bp_data)
+            _sessions[thread_id] = state
+        except Exception:
+            pass
+
+        # Move to finalised phase (ask to save)
+        _thread_meta[thread_id] = {
+            **_thread_meta.get(thread_id, {}),
+            "controller_phase": "finalised",
+        }
+        response_msg = (
+            "Got it — no knowledge base. Would you like to save the agent? "
+            "If so, what should I call it? 🤖"
+        )
+        await _save_message(
+            session=session,
+            thread_id=thread_id,
+            role="ai",
+            content=response_msg,
+            phase="finalised",
+            seq=seq,
+        )
+        await session.commit()
+        return ChatResponse(
+            thread_id=thread_id,
+            phase="finalised",
+            message=response_msg,
+            blueprint=_get_blueprint_dict(state),
+            next_action="confirm_save",
+        )
 
     if _is_rejection(user_msg):
         # User doesn't want to save
@@ -678,6 +1025,14 @@ async def _handle_save_decision(
             blueprint=_get_blueprint_dict(state),
             next_action="confirm_save",
         )
+
+    # Check for embedded name FIRST (e.g. "yes, call it Support Bot")
+    # before checking for bare confirmation, so we can save in one step.
+    extracted = await _extract_agent_name(user_msg)
+    # Only use the extracted name if the user actually provided a distinct
+    # name — not just a bare confirmation word like "yes" or "sure".
+    if extracted and not _is_confirmation(extracted):
+        return await _do_save(thread_id, extracted, state, session, seq, user_id=user_id)
 
     if _is_confirmation(user_msg):
         # User said yes but didn't give a name — ask for one
@@ -705,12 +1060,6 @@ async def _handle_save_decision(
             blueprint=_get_blueprint_dict(state),
             next_action="name_agent",
         )
-
-    # User might have given the name directly (e.g. "yes, call it Support Bot")
-    # or just typed a name
-    extracted = _extract_agent_name(user_msg)
-    if extracted:
-        return await _do_save(thread_id, extracted, state, session, seq, user_id=user_id)
 
     # Fallback — treat as confirmation, ask for name
     _thread_meta[thread_id] = {
@@ -762,7 +1111,7 @@ async def _handle_naming(
     )
     seq += 1
 
-    name = _extract_agent_name(user_msg)
+    name = await _extract_agent_name(user_msg)
     if not name:
         response_msg = (
             "I didn't quite catch that. Please give me a short name for your agent "

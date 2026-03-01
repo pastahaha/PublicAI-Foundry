@@ -27,6 +27,7 @@ from src.core.models.orchestrator import (
     NodeBlueprint,
 )
 from src.services.tool_catalogue import TOOL_REGISTRY
+from src.services.skill_catalogue import get_skills_level2_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +65,13 @@ def _build_llm(provider: str, model: str, temperature: float = 0.7):
     """Build an LLM instance.  Supports mistral and ollama."""
     if provider == "ollama":
         from langchain_ollama import ChatOllama
+        import os
 
-        return ChatOllama(model=model, temperature=temperature)
+        return ChatOllama(
+            model=model,
+            temperature=temperature,
+            base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+        )
 
     # Default: mistral (cloud)
     from langchain_mistralai import ChatMistralAI
@@ -98,15 +104,37 @@ def _get_last_user_content(state: CompiledAgentState) -> str:
 def _make_llm_node(spec: NodeBlueprint):
     """Create an LLM node that has a conversational exchange."""
 
+    # Inject Level 2 skill instructions into the system prompt
+    skill_ids = spec.skill_ids if hasattr(spec, "skill_ids") else []
+    skill_instructions = get_skills_level2_prompt(skill_ids) if skill_ids else ""
+    enriched_prompt = (spec.system_prompt or "") + skill_instructions
+
     async def _node(state: CompiledAgentState) -> dict[str, Any]:
         iteration = state.get("iteration", 0) + 1
-        logger.info("  🔄 [%s] LLM node executing (iteration %d)", spec.id, iteration)
+        logger.info(
+            "  🔄 [%s] LLM node executing (iteration %d, skills=%s)",
+            spec.id, iteration, skill_ids,
+        )
 
         llm = _build_llm(spec.model_provider, spec.model_name, spec.temperature)
         msgs: list[BaseMessage] = []
-        if spec.system_prompt:
-            msgs.append(SystemMessage(content=spec.system_prompt))
+        if enriched_prompt:
+            msgs.append(SystemMessage(content=enriched_prompt))
         msgs.extend(state["messages"])
+
+        # Mistral API requires the last message to be User or Tool role,
+        # not Assistant.  When a prior LLM/tool node has already run,
+        # the last message is an AIMessage — append a synthetic user
+        # turn so the API call is valid.
+        if msgs and isinstance(msgs[-1], AIMessage):
+            msgs.append(
+                HumanMessage(
+                    content=(
+                        "Based on the above context and any tool results, "
+                        "continue processing the user's request."
+                    )
+                )
+            )
 
         response = await llm.ainvoke(msgs)
         logger.info("  ✅ [%s] %d chars", spec.id, len(response.content))
@@ -141,30 +169,33 @@ def _make_tool_node(spec: NodeBlueprint):
                 results.append(f"[Tool '{tool_name}' not found in catalogue]")
                 continue
             try:
+                # Dispatch with the correct kwargs for each tool
                 if tool_name == "web_search":
                     result = await fn(query=input_content)
+                elif tool_name == "scrape_url":
+                    # If the input looks like a URL, use it; otherwise search for it
+                    url = input_content if input_content.startswith("http") else f"https://{input_content}"
+                    result = await fn(url=url)
                 elif tool_name == "summarize_text":
                     result = await fn(text=input_content)
-                elif tool_name == "scrape_url":
-                    result = await fn(url=input_content)
-                elif tool_name == "retrieval_query":
-                    result = await fn(query=input_content)
-                elif tool_name == "service_locator":
-                    result = await fn(service_type=input_content, location="")
-                elif tool_name == "eligibility_checker":
-                    result = await fn(program="", user_info={})
-                elif tool_name == "rights_lookup":
-                    result = await fn(topic=input_content)
-                elif tool_name == "crisis_classifier":
-                    result = await fn(message=input_content)
                 elif tool_name == "document_explainer":
                     result = await fn(document_text=input_content)
+                elif tool_name == "retrieval_query":
+                    result = await fn(query=input_content)
+                elif tool_name == "eligibility_checker":
+                    result = await fn(program="", circumstances=input_content)
+                elif tool_name == "service_locator":
+                    result = await fn(postcode_or_suburb="", service_type=input_content)
+                elif tool_name == "rights_lookup":
+                    result = await fn(topic=input_content, situation="")
+                elif tool_name == "crisis_classifier":
+                    result = await fn(situation=input_content)
                 elif tool_name == "safety_planner":
                     result = await fn(situation=input_content)
                 elif tool_name == "hotline_directory":
-                    result = await fn(category=input_content)
+                    result = await fn(crisis_type=input_content)
                 elif tool_name == "human_review":
-                    result = await fn(case_summary=input_content)
+                    result = await fn(question=input_content)
                 else:
                     result = await fn()
                 results.append(result)
@@ -205,6 +236,9 @@ _NODE_FACTORIES = {
     "llm": _make_llm_node,
     "tool": _make_tool_node,
     "aggregator": _make_aggregator_node,
+    # The LLM sometimes generates "human_review" as a node type —
+    # treat it as an LLM node so it doesn't get silently dropped.
+    "human_review": _make_llm_node,
 }
 
 
@@ -242,6 +276,13 @@ def _make_brain_node(blueprint: GeneratedBlueprint):
         for t in node.tool_names:
             all_tools.add(t)
 
+    # Collect all skills from all nodes for the brain's context
+    all_skill_ids = []
+    for node in blueprint.nodes:
+        for sid in (node.skill_ids if hasattr(node, "skill_ids") else []):
+            if sid not in all_skill_ids:
+                all_skill_ids.append(sid)
+
     tool_hint = ""
     if all_tools:
         tool_hint = (
@@ -251,14 +292,18 @@ def _make_brain_node(blueprint: GeneratedBlueprint):
             "Use them to inform your response."
         )
 
+    skill_hint = get_skills_level2_prompt(all_skill_ids) if all_skill_ids else ""
+
     system_prompt = (
         f"You are **{blueprint.name}**.\n"
         f"{blueprint.description}\n\n"
         f"Your goal: {blueprint.goal}\n"
-        f"{tool_hint}\n\n"
+        f"{tool_hint}\n"
+        f"{skill_hint}\n\n"
         "INSTRUCTIONS:\n"
         "- Respond naturally and helpfully to the user's message.\n"
         "- If tool results are available in the conversation, incorporate them.\n"
+        "- Follow any active skill patterns listed above.\n"
         "- If you don't have enough information, say so honestly.\n"
         "- Be concise but thorough.\n"
         "- Do NOT output raw JSON or tool calls — respond in plain language."
@@ -299,7 +344,7 @@ def _make_brain_node(blueprint: GeneratedBlueprint):
 # ── Conditional router ───────────────────────────────────────────────
 
 
-def _make_router(blueprint: GeneratedBlueprint, source_id: str):
+def _make_router(blueprint: GeneratedBlueprint, source_id: str, valid_targets: set[str] | None = None):
     cond_edges = [
         e
         for e in blueprint.edges
@@ -311,6 +356,14 @@ def _make_router(blueprint: GeneratedBlueprint, source_id: str):
     fallback = direct_edges[0].target if direct_edges else END
 
     target_map: dict[str, str] = {e.target: (e.condition or "") for e in cond_edges}
+
+    # If valid_targets provided, filter out any targets that aren't real graph nodes.
+    # This prevents the router from ever returning an invalid target like a tool name.
+    if valid_targets:
+        filtered_targets = {t: c for t, c in target_map.items() if t in valid_targets}
+        if fallback not in valid_targets and fallback != END:
+            fallback = END
+        target_map = filtered_targets
 
     async def router(state: CompiledAgentState) -> str:
         iteration = state.get("iteration", 0)
@@ -409,12 +462,32 @@ def compile_blueprint(blueprint: GeneratedBlueprint) -> Any:
             if target == "__end__":
                 target = "brain"  # Redirect END → brain so we always get a response
             if target in node_ids or target == "brain":
-                graph.add_edge(edge.source, target)
+                if edge.source in node_ids:
+                    graph.add_edge(edge.source, target)
+                else:
+                    logger.warning(
+                        "  ⚠️ Skipping edge: source '%s' is not a graph node",
+                        edge.source,
+                    )
 
     for source_id in cond_sources:
-        router, path_map = _make_router(blueprint, source_id)
+        # Pass valid_targets so the router itself never returns invalid targets
+        valid_targets = node_ids | {"brain", END}
+        router, path_map = _make_router(blueprint, source_id, valid_targets=valid_targets)
         # Rewrite any __end__ targets to brain
         path_map = {k: ("brain" if v == END else v) for k, v in path_map.items()}
+        # Drop targets that aren't registered graph nodes (e.g. tool names
+        # the LLM mistakenly used as edge targets like "human_review").
+        path_map = {k: v for k, v in path_map.items() if v in valid_targets}
+        if not path_map:
+            # All conditional targets were invalid — fall back to a direct
+            # edge to the brain so the graph stays connected.
+            logger.warning(
+                "  ⚠️ All conditional targets from '%s' were invalid — routing to brain",
+                source_id,
+            )
+            graph.add_edge(source_id, "brain")
+            continue
         graph.add_conditional_edges(source_id, router, path_map)
 
     # 5. Terminal nodes → brain (instead of END)
