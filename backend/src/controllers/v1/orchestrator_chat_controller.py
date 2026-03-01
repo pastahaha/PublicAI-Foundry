@@ -105,6 +105,7 @@ class BuildFromFormRequest(BaseModel):
     knowledge_base: dict = Field(default_factory=dict)
     use_case: Optional[str] = None
     model_provider: str = Field("mistral")
+    voice_id: Optional[str] = Field(None, description="ElevenLabs voice ID for TTS")
 
 
 class ChatMessage(BaseModel):
@@ -331,6 +332,7 @@ async def _internal_save_agent(
     description: str | None = None,
     session: AsyncSession,
     user_id: str = "system",
+    voice_id: str | None = None,
 ) -> dict:
     """Save the blueprint as an assistant — the 'internal tool call'."""
     bp_json = state.get("final_blueprint", "")
@@ -351,6 +353,7 @@ async def _internal_save_agent(
         "tools": [],
         "tool_reasons": {},
         "blueprint": bp_data,
+        "voice_id": voice_id,
     }
 
     for node in blueprint.nodes:
@@ -1517,6 +1520,7 @@ async def build_from_form(
             description=req.description,
             session=session,
             user_id=user_id,
+            voice_id=req.voice_id,
         )
 
         assistant_id = result["assistant_id"]

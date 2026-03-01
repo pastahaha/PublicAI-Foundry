@@ -11,7 +11,7 @@ export default async function EditAgentPage({ params }: { params: Promise<{ id: 
 
   const { id } = await params;
 
-  let agent: { id: string; name: string; description: string | null; model: string; systemPrompt: string; tools: string; guardrails: string } | null = null;
+  let agent: { id: string; name: string; description: string | null; model: string; systemPrompt: string; tools: string; guardrails: string; voiceId?: string | null } | null = null;
 
   try {
     const res = await fetch(`${getBackendUrl()}/api/v1/assistant/${id}`, {
@@ -30,6 +30,7 @@ export default async function EditAgentPage({ params }: { params: Promise<{ id: 
         systemPrompt: (config.system_prompt as string) || "",
         tools: JSON.stringify((config.tools as string[]) || []),
         guardrails: JSON.stringify((meta.guardrails as object) || {}),
+        voiceId: (config.voice_id as string) || null,
       };
     }
   } catch {
@@ -61,6 +62,7 @@ export default async function EditAgentPage({ params }: { params: Promise<{ id: 
             systemPrompt: agent.systemPrompt,
             tools: agent.tools,
             guardrails: agent.guardrails,
+            voiceId: agent.voiceId,
           }}
         />
       </div>

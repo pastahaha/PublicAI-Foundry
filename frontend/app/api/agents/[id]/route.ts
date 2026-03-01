@@ -14,6 +14,7 @@ function toAgent(a: Record<string, unknown>) {
     model: (config.model_name as string) || "mistral-large-latest",
     systemPrompt: (config.system_prompt as string) || "",
     tools: (config.tools as string[]) || [],
+    voiceId: (config.voice_id as string) || null,
     guardrails: (meta.guardrails as Record<string, unknown>) || {},
     knowledgeBase: (meta.knowledgeBase as Record<string, unknown>) || {},
     isActive: true,
@@ -49,6 +50,7 @@ const updateSchema = z.object({
   model: z.string().optional(),
   systemPrompt: z.string().min(1).optional(),
   tools: z.array(z.string()).optional(),
+  voiceId: z.string().nullable().optional(),
   guardrails: z.record(z.string(), z.unknown()).optional(),
   knowledgeBase: z.record(z.string(), z.unknown()).optional(),
   isActive: z.boolean().optional(),
@@ -72,6 +74,7 @@ export async function PUT(
     if (data.model) configUpdates.model_name = data.model;
     if (data.systemPrompt) configUpdates.system_prompt = data.systemPrompt;
     if (data.tools) configUpdates.tools = data.tools;
+    if (data.voiceId !== undefined) configUpdates.voice_id = data.voiceId;
 
     const patchPayload: Record<string, unknown> = {};
     if (data.name) patchPayload.name = data.name;
@@ -89,6 +92,7 @@ export async function PUT(
           model_name: configUpdates.model_name || curConfig.model_name || "mistral-large-latest",
           system_prompt: configUpdates.system_prompt || curConfig.system_prompt || "",
           tools: configUpdates.tools || curConfig.tools || [],
+          voice_id: configUpdates.voice_id !== undefined ? configUpdates.voice_id : (curConfig.voice_id || null),
           temperature: curConfig.temperature || 0.7,
           max_tokens: curConfig.max_tokens || 4096,
         };

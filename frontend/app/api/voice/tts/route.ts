@@ -12,11 +12,12 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "ElevenLabs API key not configured" }, { status: 400 });
   }
 
-  const voiceId = user?.elevenLabsVoiceId || "21m00Tcm4TlvDq8ikWAM";
-
   try {
-    const { text } = await req.json();
+    const { text, voiceId: requestVoiceId } = await req.json();
     if (!text) return NextResponse.json({ error: "No text provided" }, { status: 400 });
+
+    // Priority: request body voiceId (per-agent) → user's default → hardcoded default
+    const voiceId = requestVoiceId || user?.elevenLabsVoiceId || "21m00Tcm4TlvDq8ikWAM";
 
     const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`, {
       method: "POST",
@@ -33,6 +34,8 @@ export async function POST(req: NextRequest) {
     });
 
     if (!res.ok) {
+      const err = await res.text();
+      console.error("ElevenLabs TTS error:", res.status, err);
       return NextResponse.json({ error: "TTS failed" }, { status: 502 });
     }
 
