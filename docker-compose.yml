@@ -2,16 +2,16 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: publicai
-      POSTGRES_PASSWORD: publicai_dev
-      POSTGRES_DB: publicai_foundry
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U publicai -d publicai_foundry"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -21,11 +21,11 @@ services:
     ports:
       - "8082:8082"
     environment:
-      DATABASE_URL: postgresql+asyncpg://publicai:publicai_dev@postgres:5432/publicai_foundry
-      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-REDACTED}
-      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-REDACTED}
-      TAVILY_API_KEY: ${TAVILY_API_KEY:-REDACTED}
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY}
+      TAVILY_API_KEY: ${TAVILY_API_KEY}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -40,17 +40,20 @@ services:
     ports:
       - "3000:3000"
     environment:
-      DATABASE_URL: postgresql://publicai:publicai_dev@postgres:5432/publicai_users
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/publicai_users
       INTERNAL_BACKEND_URL: http://backend:8082
       NEXT_PUBLIC_BACKEND_URL: http://localhost:8082
-      JWT_SECRET: ${JWT_SECRET:-REDACTED}
-      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-REDACTED}
-      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-REDACTED}
-      NEXT_PUBLIC_TWILIO_WHATSAPP_NUMBER: ${TWILIO_WHATSAPP_NUMBER:-+14155238886}
-      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-REDACTED}
-      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-REDACTED}
-      NEXT_PUBLIC_HAS_GOOGLE: ${NEXT_PUBLIC_HAS_GOOGLE:-false}
-      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
+      JWT_SECRET: ${JWT_SECRET}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY}
+      NEXT_PUBLIC_TWILIO_WHATSAPP_NUMBER: ${TWILIO_WHATSAPP_NUMBER}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
+      TWILIO_API_KEY: ${TWILIO_API_KEY}
+      TWILIO_API_SECRET: ${TWILIO_API_SECRET}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      NEXT_PUBLIC_HAS_GOOGLE: ${NEXT_PUBLIC_HAS_GOOGLE}
+      NEXTAUTH_URL: ${NEXTAUTH_URL}
     depends_on:
       postgres:
         condition: service_healthy
