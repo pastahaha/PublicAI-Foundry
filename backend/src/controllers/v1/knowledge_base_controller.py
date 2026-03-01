@@ -2,14 +2,17 @@
 
 Endpoints:
   GET    /knowledge-base/{kb_id}              — Get KB details & document list
+  GET    /knowledge-base/{kb_id}/stats        — Get vector store stats
   POST   /knowledge-base/{kb_id}/ingest       — Upload files for ingestion
   POST   /knowledge-base/{kb_id}/ingest/url   — Ingest from a URL
   POST   /knowledge-base/{kb_id}/ingest/text  — Ingest raw text
+  POST   /knowledge-base/{kb_id}/ingest/batch-urls — Ingest multiple URLs
   DELETE /knowledge-base/{kb_id}/documents/{doc_id} — Remove a document
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from uuid import uuid4
@@ -25,6 +28,11 @@ from src.core.orm import (
     KnowledgeBase as KnowledgeBaseORM,
     KnowledgeBaseDocument as KnowledgeBaseDocumentORM,
     get_session,
+)
+from src.services.ingestion_service import (
+    ingest_text_to_chroma,
+    ingest_url_to_chroma,
+    get_collection_stats,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,11 +79,23 @@ class IngestTextRequest(BaseModel):
     filename: str = Field("inline_text.txt", description="Display name for the text")
 
 
+class BatchUrlRequest(BaseModel):
+    """Ingest multiple URLs at once (used by orchestrator auto-ingestion)."""
+    urls: List[dict] = Field(
+        ...,
+        description='List of {url, label?, description?} objects to ingest',
+    )
+    chunk_size: int = Field(500, description="Characters per chunk")
+    chunk_overlap: int = Field(50, description="Overlap between chunks")
+
+
 class IngestResponse(BaseModel):
     kb_id: str
     doc_id: str
     filename: str
     status: str
+    chunk_count: int = 0
+    size_bytes: int = 0
     message: str
 
 
@@ -156,6 +176,28 @@ async def ingest_files(
         content = await f.read()
         size = len(content)
 
+        # Decode text content for embedding
+        try:
+            text_content = content.decode("utf-8", errors="replace")
+        except Exception:
+            text_content = content.decode("latin-1", errors="replace")
+
+        # Ingest into ChromaDB
+        chroma_result = await ingest_text_to_chroma(
+            kb_id=kb_id,
+            doc_id=doc_id,
+            text=text_content,
+            metadata={
+                "source_type": "file",
+                "filename": f.filename or "unnamed",
+                "content_type": f.content_type or "text/plain",
+            },
+            chunk_size=500,
+            chunk_overlap=50,
+        )
+        chunk_count = chroma_result.get("chunk_count", 0)
+        ingest_status = chroma_result.get("status", "ingested")
+
         doc = KnowledgeBaseDocumentORM(
             doc_id=doc_id,
             kb_id=kb_id,
@@ -163,20 +205,18 @@ async def ingest_files(
             content_type=f.content_type or "application/octet-stream",
             source_type="file",
             source_value=f.filename or "",
-            status="ingested",  # TODO: change to "pending" when async chunking is added
-            chunk_count=0,  # TODO: populate after chunking
+            status=ingest_status,
+            chunk_count=chunk_count,
             size_bytes=size,
+            error_message=chroma_result.get("error"),
             metadata_json={"original_filename": f.filename},
             created_at=now,
         )
         session.add(doc)
 
         logger.info(
-            "📄 Document ingested: kb=%s doc=%s file='%s' size=%d bytes",
-            kb_id,
-            doc_id,
-            f.filename,
-            size,
+            "📄 Document ingested: kb=%s doc=%s file='%s' size=%d chunks=%d",
+            kb_id, doc_id, f.filename, size, chunk_count,
         )
 
         results.append(
@@ -184,8 +224,10 @@ async def ingest_files(
                 kb_id=kb_id,
                 doc_id=doc_id,
                 filename=f.filename or "unnamed",
-                status="ingested",
-                message=f"File '{f.filename}' uploaded ({size} bytes). Chunking and embedding pending.",
+                status=ingest_status,
+                chunk_count=chunk_count,
+                size_bytes=size,
+                message=f"File '{f.filename}' ingested ({size} bytes, {chunk_count} chunks).",
             )
         )
 
@@ -222,19 +264,36 @@ async def ingest_url(
     doc_id = str(uuid4())
     filename = req.filename or req.url.split("/")[-1] or "web_page"
 
-    # TODO: actually scrape the URL here
-    # For now, create the document record
+    # Actually scrape and ingest the URL into ChromaDB
+    chroma_result = await ingest_url_to_chroma(
+        kb_id=kb_id,
+        doc_id=doc_id,
+        url=req.url,
+        label=filename,
+        chunk_size=500,
+        chunk_overlap=50,
+    )
+    chunk_count = chroma_result.get("chunk_count", 0)
+    size_bytes = chroma_result.get("size_bytes", 0)
+    ingest_status = chroma_result.get("status", "ingested")
+    title = chroma_result.get("title", filename)
+
     doc = KnowledgeBaseDocumentORM(
         doc_id=doc_id,
         kb_id=kb_id,
-        filename=filename,
+        filename=title,
         content_type="text/html",
         source_type="url",
         source_value=req.url,
-        status="ingested",
-        chunk_count=0,
-        size_bytes=0,
-        metadata_json={"url": req.url},
+        status=ingest_status,
+        chunk_count=chunk_count,
+        size_bytes=size_bytes,
+        error_message=chroma_result.get("error"),
+        metadata_json={
+            "url": req.url,
+            "title": title,
+            "description": chroma_result.get("description", ""),
+        },
         created_at=now,
     )
     session.add(doc)
@@ -244,14 +303,19 @@ async def ingest_url(
     kb.updated_at = now
     await session.commit()
 
-    logger.info("🌐 URL ingested: kb=%s doc=%s url='%s'", kb_id, doc_id, req.url)
+    logger.info(
+        "🌐 URL ingested: kb=%s doc=%s url='%s' chunks=%d",
+        kb_id, doc_id, req.url, chunk_count,
+    )
 
     return IngestResponse(
         kb_id=kb_id,
         doc_id=doc_id,
-        filename=filename,
-        status="ingested",
-        message=f"URL '{req.url}' ingested. Chunking and embedding pending.",
+        filename=title,
+        status=ingest_status,
+        chunk_count=chunk_count,
+        size_bytes=size_bytes,
+        message=f"URL '{req.url}' ingested ({size_bytes} bytes, {chunk_count} chunks).",
     )
 
 
@@ -273,6 +337,22 @@ async def ingest_text(
 
     now = datetime.now(UTC)
     doc_id = str(uuid4())
+    size_bytes = len(req.text.encode("utf-8"))
+
+    # Ingest into ChromaDB
+    chroma_result = await ingest_text_to_chroma(
+        kb_id=kb_id,
+        doc_id=doc_id,
+        text=req.text,
+        metadata={
+            "source_type": "text",
+            "filename": req.filename,
+        },
+        chunk_size=500,
+        chunk_overlap=50,
+    )
+    chunk_count = chroma_result.get("chunk_count", 0)
+    ingest_status = chroma_result.get("status", "ingested")
 
     doc = KnowledgeBaseDocumentORM(
         doc_id=doc_id,
@@ -281,9 +361,10 @@ async def ingest_text(
         content_type="text/plain",
         source_type="text",
         source_value=req.text[:200],  # store preview
-        status="ingested",
-        chunk_count=0,
-        size_bytes=len(req.text.encode("utf-8")),
+        status=ingest_status,
+        chunk_count=chunk_count,
+        size_bytes=size_bytes,
+        error_message=chroma_result.get("error"),
         metadata_json={"text_length": len(req.text)},
         created_at=now,
     )
@@ -294,14 +375,19 @@ async def ingest_text(
     kb.updated_at = now
     await session.commit()
 
-    logger.info("📝 Text ingested: kb=%s doc=%s len=%d", kb_id, doc_id, len(req.text))
+    logger.info(
+        "📝 Text ingested: kb=%s doc=%s len=%d chunks=%d",
+        kb_id, doc_id, len(req.text), chunk_count,
+    )
 
     return IngestResponse(
         kb_id=kb_id,
         doc_id=doc_id,
         filename=req.filename,
-        status="ingested",
-        message=f"Text ingested ({len(req.text)} chars). Chunking and embedding pending.",
+        status=ingest_status,
+        chunk_count=chunk_count,
+        size_bytes=size_bytes,
+        message=f"Text ingested ({len(req.text)} chars, {chunk_count} chunks).",
     )
 
 
@@ -336,4 +422,153 @@ async def delete_document(
     return {
         "success": True,
         "message": f"Document '{doc_id}' removed from knowledge base.",
+    }
+
+
+# ── POST /knowledge-base/{kb_id}/ingest/batch-urls ──────────────────
+
+
+@kb_router.post("/{kb_id}/ingest/batch-urls")
+async def ingest_batch_urls(
+    kb_id: str,
+    req: BatchUrlRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """Ingest multiple URLs concurrently into the knowledge base.
+
+    Each URL is scraped, chunked, embedded, and stored in ChromaDB.
+    Used by the orchestrator to auto-ingest curated reference sources.
+    """
+    kb = await session.get(KnowledgeBaseORM, kb_id)
+    if not kb:
+        raise HTTPException(
+            status_code=404, detail=f"Knowledge base '{kb_id}' not found"
+        )
+
+    now = datetime.now(UTC)
+    results = []
+    total_chunks = 0
+    total_bytes = 0
+    success_count = 0
+    error_count = 0
+
+    # Process URLs concurrently in batches of 5
+    for batch_start in range(0, len(req.urls), 5):
+        batch = req.urls[batch_start : batch_start + 5]
+        tasks = []
+        doc_ids = []
+
+        for url_item in batch:
+            url = url_item.get("url", "") if isinstance(url_item, dict) else str(url_item)
+            label = url_item.get("label", "") if isinstance(url_item, dict) else ""
+            if not url:
+                continue
+            doc_id = str(uuid4())
+            doc_ids.append((doc_id, url, label, url_item))
+            tasks.append(
+                ingest_url_to_chroma(
+                    kb_id=kb_id,
+                    doc_id=doc_id,
+                    url=url,
+                    label=label,
+                    chunk_size=req.chunk_size,
+                    chunk_overlap=req.chunk_overlap,
+                )
+            )
+
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for (doc_id, url, label, url_item), result in zip(doc_ids, batch_results):
+            if isinstance(result, Exception):
+                result = {"doc_id": doc_id, "chunk_count": 0, "status": "error", "error": str(result)}
+
+            chunk_count = result.get("chunk_count", 0)
+            size_bytes = result.get("size_bytes", 0)
+            status = result.get("status", "error")
+            title = result.get("title", label or url)
+            description = url_item.get("description", "") if isinstance(url_item, dict) else ""
+
+            doc = KnowledgeBaseDocumentORM(
+                doc_id=doc_id,
+                kb_id=kb_id,
+                filename=title,
+                content_type="text/html",
+                source_type="url",
+                source_value=url,
+                status=status,
+                chunk_count=chunk_count,
+                size_bytes=size_bytes,
+                error_message=result.get("error"),
+                metadata_json={
+                    "url": url,
+                    "title": title,
+                    "label": label,
+                    "description": description or result.get("description", ""),
+                },
+                created_at=now,
+            )
+            session.add(doc)
+
+            if status == "ingested":
+                success_count += 1
+                total_chunks += chunk_count
+                total_bytes += size_bytes
+            else:
+                error_count += 1
+
+            results.append({
+                "doc_id": doc_id,
+                "url": url,
+                "title": title,
+                "status": status,
+                "chunk_count": chunk_count,
+                "size_bytes": size_bytes,
+                "error": result.get("error"),
+            })
+
+    # Update KB counters
+    kb.document_count = (kb.document_count or 0) + success_count
+    kb.status = "ready" if kb.document_count > 0 else "pending"
+    kb.updated_at = now
+    await session.commit()
+
+    logger.info(
+        "📚 Batch URL ingestion: kb=%s success=%d errors=%d total_chunks=%d total_bytes=%d",
+        kb_id, success_count, error_count, total_chunks, total_bytes,
+    )
+
+    return {
+        "kb_id": kb_id,
+        "total_urls": len(req.urls),
+        "success_count": success_count,
+        "error_count": error_count,
+        "total_chunks": total_chunks,
+        "total_bytes": total_bytes,
+        "results": results,
+    }
+
+
+# ── GET /knowledge-base/{kb_id}/stats ────────────────────────────────
+
+
+@kb_router.get("/{kb_id}/stats")
+async def get_kb_stats(
+    kb_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """Get vector store statistics for a knowledge base."""
+    kb = await session.get(KnowledgeBaseORM, kb_id)
+    if not kb:
+        raise HTTPException(
+            status_code=404, detail=f"Knowledge base '{kb_id}' not found"
+        )
+
+    chroma_stats = await get_collection_stats(kb_id)
+
+    return {
+        "kb_id": kb_id,
+        "name": kb.name,
+        "status": kb.status,
+        "document_count": kb.document_count,
+        "vector_store": chroma_stats,
     }

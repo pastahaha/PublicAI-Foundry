@@ -7,7 +7,8 @@ import { motion, AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
 import {
   Bot, Plus, Edit, Trash2, MoreVertical, Search,
-  Zap, ZapOff, Copy
+  Zap, ZapOff, Copy, GitBranch, BarChart3, Play,
+  Clock, MessageSquare
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -186,7 +187,22 @@ export function AgentsClient({ agents: initial }: { agents: Agent[] }) {
                       <DropdownMenuContent align="end" className="w-44">
                         <DropdownMenuItem asChild>
                           <Link href={`/agents/${agent.id}`}>
+                            <Bot className="w-3.5 h-3.5 mr-2" /> View Details
+                          </Link>
+                        </DropdownMenuItem>
+                        <DropdownMenuItem asChild>
+                          <Link href={`/agents/${agent.id}/edit`}>
                             <Edit className="w-3.5 h-3.5 mr-2" /> Edit
+                          </Link>
+                        </DropdownMenuItem>
+                        <DropdownMenuItem asChild>
+                          <Link href={`/agents/${agent.id}/sessions`}>
+                            <BarChart3 className="w-3.5 h-3.5 mr-2" /> Sessions
+                          </Link>
+                        </DropdownMenuItem>
+                        <DropdownMenuItem asChild>
+                          <Link href={`/agents/${agent.id}/blueprint`}>
+                            <GitBranch className="w-3.5 h-3.5 mr-2" /> Blueprint
                           </Link>
                         </DropdownMenuItem>
                         <DropdownMenuItem onClick={() => handleToggle(agent)}>
@@ -223,7 +239,17 @@ export function AgentsClient({ agents: initial }: { agents: Agent[] }) {
                   <div className="relative flex items-center gap-2 pt-3 border-t border-[var(--border)]">
                     <Button asChild size="sm" variant="ghost" className="flex-1 rounded-xl text-xs h-8 text-[var(--muted-foreground)] hover:text-[var(--foreground)]">
                       <Link href={`/agents/${agent.id}`}>
-                        <Edit className="w-3 h-3 mr-1.5" /> Edit
+                        <Bot className="w-3 h-3 mr-1.5" /> Details
+                      </Link>
+                    </Button>
+                    <Button asChild size="sm" variant="ghost" className="rounded-xl text-xs h-8 text-[var(--muted-foreground)] hover:text-cyan-400 px-2.5">
+                      <Link href={`/agents/${agent.id}/sessions`}>
+                        <BarChart3 className="w-3 h-3" />
+                      </Link>
+                    </Button>
+                    <Button asChild size="sm" variant="ghost" className="rounded-xl text-xs h-8 text-[var(--muted-foreground)] hover:text-violet-400 px-2.5">
+                      <Link href={`/agents/${agent.id}/blueprint`}>
+                        <GitBranch className="w-3 h-3" />
                       </Link>
                     </Button>
                     <Button
@@ -233,7 +259,7 @@ export function AgentsClient({ agents: initial }: { agents: Agent[] }) {
                       variant="ghost"
                     >
                       <Link href={`/playground?agent=${agent.id}`}>
-                        Test in Playground
+                        <Play className="w-3 h-3 mr-1" /> Test
                       </Link>
                     </Button>
                   </div>

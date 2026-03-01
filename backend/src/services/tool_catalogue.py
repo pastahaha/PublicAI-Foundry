@@ -359,23 +359,62 @@ async def document_explainer(
         })
 
 
-# ─── 5. retrieval_query — placeholder (needs vector store) ───────────
+# ─── 5. retrieval_query — ChromaDB vector search ────────────────────
 
 async def retrieval_query(
     query: str, knowledge_base: str = "default", **kw: Any
 ) -> str:
-    """Query a knowledge base for relevant chunks. (placeholder — needs vector store)"""
-    logger.info("  📚 retrieval_query: query='%s', kb='%s' (placeholder)", query, knowledge_base)
-    return json.dumps({
-        "query": query,
-        "knowledge_base": knowledge_base,
-        "results": [{
-            "chunk": f"Knowledge base '{knowledge_base}' is not yet populated. "
-                     "Upload documents to enable retrieval.",
-            "score": 0.0,
-        }],
-        "note": "Vector store integration pending — documents need to be ingested first.",
-    })
+    """Query a knowledge base for relevant chunks via ChromaDB."""
+    logger.info("  📚 retrieval_query: query='%s', kb='%s'", query, knowledge_base)
+
+    try:
+        from src.services.ingestion_service import query_chroma
+
+        results = await query_chroma(
+            kb_id=knowledge_base,
+            query=query,
+            n_results=5,
+        )
+
+        if not results:
+            return json.dumps({
+                "query": query,
+                "knowledge_base": knowledge_base,
+                "results": [{
+                    "chunk": f"No relevant documents found in knowledge base '{knowledge_base}'. "
+                             "The KB may be empty or the documents may not cover this topic.",
+                    "score": 0.0,
+                }],
+                "note": "No matching chunks found. Try uploading relevant documents.",
+            })
+
+        formatted = []
+        for r in results:
+            formatted.append({
+                "chunk": r["chunk"],
+                "score": r["score"],
+                "source": r.get("source_url") or r.get("title", ""),
+                "label": r.get("label", ""),
+            })
+
+        return json.dumps({
+            "query": query,
+            "knowledge_base": knowledge_base,
+            "results": formatted,
+            "total_results": len(formatted),
+        })
+
+    except Exception as e:
+        logger.error("  ❌ retrieval_query failed: %s", e)
+        return json.dumps({
+            "query": query,
+            "knowledge_base": knowledge_base,
+            "results": [{
+                "chunk": f"Retrieval error: {e}",
+                "score": 0.0,
+            }],
+            "note": f"Vector store query failed: {e}",
+        })
 
 
 # ─── 6. eligibility_checker — web-search augmented ───────────────────

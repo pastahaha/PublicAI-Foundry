@@ -55,6 +55,7 @@ from src.services.orchestrator_agent import (
     OrchestratorState,
     build_orchestrator_graph,
 )
+from src.services.ingestion_service import ingest_url_to_chroma
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,21 @@ class ChatRequest(BaseModel):
         "mistral-large-latest",
         description="Model name, e.g. 'mistral-large-latest' for Mistral or 'qwen2.5:3b' for Ollama",
     )
+
+
+class BuildFromFormRequest(BaseModel):
+    """Build an agent from the manual form — routes through the orchestrator
+    (research → plan → review → finalise → save) in a single call."""
+
+    name: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = None
+    model: str = Field("mistral-large-latest")
+    system_prompt: str = Field(..., min_length=1)
+    tools: list[str] = Field(default_factory=list)
+    guardrails: dict = Field(default_factory=dict)
+    knowledge_base: dict = Field(default_factory=dict)
+    use_case: Optional[str] = None
+    model_provider: str = Field("mistral")
 
 
 class ChatMessage(BaseModel):
@@ -379,6 +395,51 @@ async def _internal_save_agent(
         session.add(kb_orm)
         config["kb_id"] = kb_id
         logger.info("📚 KB created: id=%s name='%s'", kb_id, merged_name)
+
+        # ── Auto-ingest URL sources in the background ────────────────
+        url_sources = [
+            kb for kb in blueprint.knowledge_bases
+            if kb.source_type == "url" and kb.source_value
+        ]
+        if url_sources:
+            async def _bg_ingest():
+                """Ingest curated URLs concurrently (fire-and-forget)."""
+                ingested = 0
+                errors = 0
+                for batch_start in range(0, len(url_sources), 5):
+                    batch = url_sources[batch_start : batch_start + 5]
+                    tasks = [
+                        ingest_url_to_chroma(
+                            kb_id=kb_id,
+                            doc_id=str(uuid4()),
+                            url=src.source_value,
+                            label=src.name,
+                            chunk_size=src.chunk_size,
+                            chunk_overlap=src.chunk_overlap,
+                        )
+                        for src in batch
+                    ]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    for src_kb, res in zip(batch, results):
+                        if isinstance(res, Exception):
+                            errors += 1
+                            logger.error("  ❌ Auto-ingest failed for %s: %s", src_kb.source_value, res)
+                        elif res.get("status") == "ingested":
+                            ingested += 1
+                        else:
+                            errors += 1
+
+                logger.info(
+                    "📚 Auto-ingestion complete for KB %s: %d ingested, %d errors (of %d URLs)",
+                    kb_id, ingested, errors, len(url_sources),
+                )
+
+            # Fire off the ingestion — don't block the save
+            asyncio.create_task(_bg_ingest())
+            logger.info(
+                "🚀 Started background ingestion of %d URLs for KB %s",
+                len(url_sources), kb_id,
+            )
 
     # ── Create Assistant ─────────────────────────────────────────────
     assistant = AssistantORM(
@@ -1319,3 +1380,184 @@ async def get_chat_history(
         "messages": [m.model_dump() for m in messages],
         "assistant_id": (thread.metadata_json or {}).get("assistant_id"),
     }
+
+
+# ── POST /orchestrator/build-from-form ──────────────────────────────
+
+
+@orchestrator_chat_router.post("/build-from-form")
+async def build_from_form(
+    req: BuildFromFormRequest,
+    session: AsyncSession = Depends(get_session),
+    user_id: str = Header("system", alias="X-User-Id"),
+):
+    """Build an agent from manual form data via the orchestrator pipeline.
+
+    Instead of just saving the form as a bare assistant (no blueprint),
+    this routes all form preferences through the orchestrator's
+    research → plan → review → finalise → save flow so the agent gets
+    a proper blueprint with tools, skills, and architecture.
+
+    Skips clarification since all info is already provided by the form.
+    """
+    thread_id = str(uuid4())
+    now = datetime.now(UTC)
+
+    logger.info("=" * 70)
+    logger.info("🏗️  BUILD-FROM-FORM — Orchestrator pipeline for manual build")
+    logger.info("   Thread:   %s", thread_id)
+    logger.info("   Name:     %s", req.name)
+    logger.info("   Model:    %s/%s", req.model_provider, req.model)
+    logger.info("=" * 70)
+
+    # Build a detailed orchestrator prompt from all the form data
+    prompt_parts = [
+        f"Build an AI agent with these specifications:",
+        f"Name: {req.name}",
+    ]
+    if req.description:
+        prompt_parts.append(f"Description: {req.description}")
+    prompt_parts.append(f"Model: {req.model}")
+    prompt_parts.append(f"System Prompt:\n{req.system_prompt}")
+
+    if req.tools:
+        prompt_parts.append(f"Tools the user selected: {', '.join(req.tools)}")
+
+    guardrails = req.guardrails
+    active_guardrails: list[str] = []
+    if guardrails.get("toxicity"):
+        active_guardrails.append("Toxicity Filter")
+    if guardrails.get("pii"):
+        active_guardrails.append("PII Redaction")
+    if guardrails.get("maxTokens"):
+        active_guardrails.append("Response Length Limit")
+    if active_guardrails:
+        prompt_parts.append(f"Guardrails: {', '.join(active_guardrails)}")
+    custom_instructions = guardrails.get("customInstructions", "")
+    if custom_instructions:
+        prompt_parts.append(f"Custom guardrail rules: {custom_instructions}")
+
+    kb = req.knowledge_base
+    if kb.get("context"):
+        prompt_parts.append(f"Knowledge Base Context:\n{kb['context']}")
+    kb_urls = kb.get("urls", [])
+    if kb_urls:
+        prompt_parts.append(f"Reference Sources ({len(kb_urls)} URLs):")
+        for u in kb_urls:
+            prompt_parts.append(f"- {u}")
+
+    prompt_parts.append(
+        "Use these specifications as the foundation and generate an optimised, "
+        "production-ready agent blueprint that incorporates all the reference sources, "
+        "guardrails, and domain context."
+    )
+    user_request = "\n".join(prompt_parts)
+
+    # Create thread in DB
+    thread = ThreadORM(
+        thread_id=thread_id,
+        status="orchestrating",
+        metadata_json={
+            "type": "build_from_form",
+            "model_provider": req.model_provider,
+            "model_name": req.model,
+            "use_case": req.use_case or "",
+        },
+        user_id=user_id,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(thread)
+    await session.commit()
+
+    try:
+        # Run orchestrator with skip_clarification=True
+        initial_state: OrchestratorState = {
+            "messages": [HumanMessage(content=user_request)],
+            "user_request": user_request,
+            "model_provider": req.model_provider,
+            "model_name": req.model,
+            "use_case": req.use_case or "",
+            "skip_clarification": True,
+            "phase": OrchestratorPhase.CLARIFYING.value,
+            "clarification_questions": [],
+            "research_notes": "",
+            "blueprint_json": "",
+            "review_feedback": "",
+            "review_loop": 0,
+            "is_approved": False,
+            "final_blueprint": "",
+        }
+
+        final_state = await _run_orchestrator(initial_state)
+
+        # Verify we got a blueprint
+        bp_json = final_state.get("final_blueprint", "")
+        if not bp_json:
+            raise HTTPException(
+                status_code=500,
+                detail="Orchestrator failed to generate a blueprint",
+            )
+
+        # Override the blueprint name with the user's chosen name
+        try:
+            bp_data = json.loads(bp_json)
+            bp_data["name"] = req.name
+            if req.description:
+                bp_data["description"] = req.description
+            final_state["final_blueprint"] = json.dumps(bp_data)
+        except json.JSONDecodeError:
+            pass
+
+        # Save the agent automatically
+        result = await _internal_save_agent(
+            thread_id=thread_id,
+            state=final_state,
+            name=req.name,
+            description=req.description,
+            session=session,
+            user_id=user_id,
+        )
+
+        assistant_id = result["assistant_id"]
+        kb_id = result.get("kb_id")
+
+        # Update thread
+        thread_obj = await session.get(ThreadORM, thread_id)
+        if thread_obj:
+            thread_obj.status = "saved"
+            thread_obj.metadata_json = {
+                **(thread_obj.metadata_json or {}),
+                "assistant_id": assistant_id,
+                "kb_id": kb_id,
+            }
+            thread_obj.updated_at = datetime.now(UTC)
+        await session.commit()
+
+        logger.info(
+            "✅ BUILD-FROM-FORM complete: assistant=%s kb=%s",
+            assistant_id, kb_id,
+        )
+
+        return {
+            "assistant_id": assistant_id,
+            "name": req.name,
+            "description": result.get("description", ""),
+            "kb_id": kb_id,
+            "tools": result.get("tools", []),
+            "tool_reasons": result.get("tool_reasons", {}),
+            "blueprint": json.loads(final_state.get("final_blueprint", "{}")),
+            "phase": "saved",
+            "agent_chat_url": f"/api/v1/agent/{assistant_id}/chat",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "❌ BUILD-FROM-FORM failed: %s\n%s", e, traceback.format_exc()
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to build agent from form: {e}",
+        )

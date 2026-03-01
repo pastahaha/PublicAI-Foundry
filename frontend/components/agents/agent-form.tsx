@@ -554,37 +554,72 @@ export function AgentForm({ initial, onBuildWithAI }: AgentFormProps) {
   const onSubmit = async (data: FormData) => {
     setSaving(true);
     try {
-      const url = initial ? `/api/agents/${initial.id}` : "/api/agents";
-      const method = initial ? "PUT" : "POST";
+      if (initial) {
+        // Editing an existing agent — use CRUD endpoint
+        const res = await fetch(`/api/agents/${initial.id}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...data,
+            tools: selectedTools,
+            guardrails: {
+              toxicity: guardrails.toxicity,
+              pii: guardrails.pii,
+              maxTokens: guardrails.maxTokens,
+              customInstructions: guardrails.customInstructions,
+            },
+            knowledgeBase: {
+              context: knowledgeBase.context,
+              urls: [
+                ...knowledgeBase.templateSources.map((s) => s.url),
+                ...knowledgeBase.customUrls,
+              ],
+            },
+          }),
+        });
 
-      const res = await fetch(url, {
-        method,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ...data,
-          tools: selectedTools,
-          guardrails: {
-            toxicity: guardrails.toxicity,
-            pii: guardrails.pii,
-            maxTokens: guardrails.maxTokens,
-            customInstructions: guardrails.customInstructions,
-          },
-          knowledgeBase: {
-            context: knowledgeBase.context,
-            urls: [
-              ...knowledgeBase.templateSources.map((s) => s.url),
-              ...knowledgeBase.customUrls,
-            ],
-          },
-        }),
-      });
+        if (!res.ok) {
+          const j = await res.json();
+          throw new Error(j.error);
+        }
 
-      if (!res.ok) {
-        const j = await res.json();
-        throw new Error(j.error);
+        toast.success("Agent updated!");
+      } else {
+        // New agent — route through orchestrator for proper blueprint
+        const useCase = selectedTemplate ? TEMPLATE_TO_USE_CASE[selectedTemplate] || undefined : undefined;
+
+        const res = await fetch("/api/orchestrator/build", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...data,
+            tools: selectedTools,
+            guardrails: {
+              toxicity: guardrails.toxicity,
+              pii: guardrails.pii,
+              maxTokens: guardrails.maxTokens,
+              customInstructions: guardrails.customInstructions,
+            },
+            knowledgeBase: {
+              context: knowledgeBase.context,
+              urls: [
+                ...knowledgeBase.templateSources.map((s) => s.url),
+                ...knowledgeBase.customUrls,
+              ],
+            },
+            use_case: useCase,
+            model_provider: "mistral",
+          }),
+        });
+
+        if (!res.ok) {
+          const j = await res.json();
+          throw new Error(j.error);
+        }
+
+        toast.success("Agent created with optimised blueprint! 🎉");
       }
 
-      toast.success(initial ? "Agent updated!" : "Agent created! 🎉");
       router.push("/agents");
       router.refresh();
     } catch (err: unknown) {
